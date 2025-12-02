@@ -79,6 +79,8 @@ class MACE(torch.nn.Module):
         oeq_config: Optional[Dict[str, Any]] = None,
         lammps_mliap: Optional[bool] = False,
         readout_cls: Optional[Type[NonLinearReadoutBlock]] = NonLinearReadoutBlock,
+        num_methods: int = 0,
+        method_emb_dim: int = 0,
     ):
         super().__init__()
         self.register_buffer(
@@ -103,6 +105,14 @@ class MACE(torch.nn.Module):
         self.use_so3 = use_so3
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
+        ## add method embedding
+        self.num_methods = num_methods
+        self.method_emb_dim = method_emb_dim
+        self.use_method_emb = (
+            (num_methods is not None and num_methods > 0)
+            and (method_emb_dim is not None and method_emb_dim > 0)
+        )
+
 
         # Embedding
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
@@ -113,6 +123,24 @@ class MACE(torch.nn.Module):
             cueq_config=cueq_config,
         )
         embedding_size = node_feats_irreps.count(o3.Irrep(0, 1))
+
+        self.embedding_size = embedding_size
+        if self.use_method_emb:
+            # one embedding vector z_m per method
+            self.method_embedding = torch.nn.Embedding(
+                num_embeddings=num_methods,
+                embedding_dim=method_emb_dim,
+            )
+            # residual MLP: [s || z] -> delta_s (same dimension as scalars)
+            self.method_mlp = torch.nn.Sequential(
+                torch.nn.Linear(embedding_size + method_emb_dim, embedding_size),
+                torch.nn.SiLU(),
+                torch.nn.Linear(embedding_size, embedding_size),
+            )
+
+
+
+
         if embedding_specs is not None:
             self.embedding_specs = embedding_specs
             self.joint_embedding = GenericJointEmbedding(
@@ -317,10 +345,25 @@ class MACE(torch.nn.Module):
         )  # [n_graphs, n_heads]
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
+
+        # add one-hot method embedding (Dral-style)
+        if self.use_method_emb:
+            # method_index: [n_graphs], long
+            method_idx = data["method_index"].to(torch.long)
+            # method embedding per graph: [n_graphs, method_emb_dim]
+            z_graph = self.method_embedding(method_idx)
+            # broadcast to nodes using batch: [n_nodes]
+            z_nodes = z_graph[data["batch"]]  # [n_nodes, method_emb_dim]
+            # concatenate scalar node features with method embedding
+            x = torch.cat([node_feats, z_nodes], dim=-1)  # [n_nodes, C0 + D_m]
+            delta = self.method_mlp(x)                    # [n_nodes, C0]
+            node_feats = node_feats + delta               # residual update
+
         edge_attrs = self.spherical_harmonics(vectors)
         edge_feats, cutoff = self.radial_embedding(
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
+
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
                 lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
@@ -498,6 +541,15 @@ class ScaleShiftMACE(MACE):
 
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
+        # add one-hot method embedding (Dral-style)
+        if self.use_method_emb:
+            method_idx = data["method_index"].to(torch.long)
+            z_graph = self.method_embedding(method_idx)   # [n_graphs, D_m]
+            z_nodes = z_graph[data["batch"]]             # [n_nodes, D_m]
+            x = torch.cat([node_feats, z_nodes], dim=-1) # [n_nodes, C0 + D_m]
+            delta = self.method_mlp(x)                   # [n_nodes, C0]
+            node_feats = node_feats + delta
+
         edge_attrs = self.spherical_harmonics(vectors)
         edge_feats, cutoff = self.radial_embedding(
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers

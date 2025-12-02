@@ -1131,6 +1131,21 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         default=None,
         required=False,
     )
+
+    ## added
+    parser.add_argument(
+        "--num_methods",
+        type=int,
+        default=0,
+        help="Number of methods (for method embeddings). 0 disables method conditioning.",
+    )
+    parser.add_argument(
+        "--method_emb_dim",
+        type=int,
+        default=0,
+        help="Dimension of method embedding. 0 disables method conditioning.",
+    )
+
     return parser
 
 

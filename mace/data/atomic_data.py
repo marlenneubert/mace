@@ -343,6 +343,13 @@ class AtomicData(torch_geometric.data.Data):
             if pbc is not None
             else torch.tensor([[False, False, False]], dtype=torch.bool)
         )
+        # add method index
+        if getattr(config, "method_index", None) is not None:
+            method_index = torch.tensor(
+                config.method_index, dtype=torch.long
+            )
+        else:
+            method_index = None
 
         cls_kwargs = dict(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
@@ -372,6 +379,9 @@ class AtomicData(torch_geometric.data.Data):
             total_spin=total_spin,
             pbc=pbc,
         )
+        # method index
+        if method_index is not None:
+            cls_kwargs["method_index"] = method_index
 
         # Add other properties that aren't checked. WARNING: shape dependence
         # and unsqueeze(-1) call may implicitly be assuming that these are all

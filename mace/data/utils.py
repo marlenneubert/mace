@@ -96,10 +96,12 @@ class Configuration:
     property_weights: Dict[str, float]
     cell: Optional[Cell] = None
     pbc: Optional[Pbc] = None
-
+    
     weight: float = 1.0  # weight of config in loss
     config_type: str = DEFAULT_CONFIG_TYPE  # config_type of config
     head: str = "Default"  # head used to compute the config
+
+    method_index: Optional[int] = None  # ADDED integer ID of the method
 
 
 Configurations = List[Configuration]
@@ -189,6 +191,16 @@ def config_from_atoms(
         config_type, 1.0
     )
 
+    # Method index
+    method_index = atoms.info.get("method_index", None)
+    if method_index is not None:
+        try:
+            method_index = int(method_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid method_index {method_index!r} in atoms.info; expected an int."
+            ) from exc
+
     properties = {}
     property_weights = {}
     for name in list(key_specification.arrays_keys) + list(key_specification.info_keys):
@@ -214,6 +226,7 @@ def config_from_atoms(
         config_type=config_type,
         pbc=pbc,
         cell=cell,
+        method_index=method_index,
     )
 
 
@@ -435,6 +448,8 @@ def save_configurations_as_HDF5(configurations: Configurations, _, h5_file) -> N
         for key, value in config.property_weights.items():
             weights_subgrp[key] = write_value(value)
         subgroup["config_type"] = write_value(config.config_type)
+        # store method_index if available
+        subgroup["method_index"] = write_value(config.method_index)
 
 
 def write_value(value):
