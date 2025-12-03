@@ -543,6 +543,7 @@ class ScaleShiftMACE(MACE):
         node_feats = self.node_embedding(data["node_attrs"])
         # add one-hot method embedding (Dral-style)
         if self.use_method_emb:
+            print("DEBUG method_idx:", data["method_index"].shape, "batch:", data["batch"].shape)
             method_idx = data["method_index"].to(torch.long)
             z_graph = self.method_embedding(method_idx)   # [n_graphs, D_m]
             z_nodes = z_graph[data["batch"]]             # [n_nodes, D_m]
