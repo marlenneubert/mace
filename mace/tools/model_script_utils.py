@@ -185,6 +185,8 @@ def configure_model(
             use_reduced_cg=args.use_reduced_cg,
             use_so3=args.use_so3,
             cueq_config=cueq_config,
+            num_methods=getattr(args, "num_methods", 0),
+            method_emb_dim=getattr(args, "method_emb_dim", 0),
         )
         model_config_foundation = None
 
@@ -244,6 +246,9 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+            num_methods=getattr(args, "num_methods", 0),
+            method_emb_dim=getattr(args, "method_emb_dim", 0),
+            method_model=getattr(args, "method_model", "none"),
         )
     if args.model == "ScaleShiftMACE":
         return modules.ScaleShiftMACE(
@@ -263,6 +268,9 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+            num_methods=getattr(args, "num_methods", 0),
+            method_emb_dim=getattr(args, "method_emb_dim", 0),
+            method_model=getattr(args, "method_model", "none"),
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)

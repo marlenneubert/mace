@@ -341,10 +341,22 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
 
     ## added 
     parser.add_argument(
+        "--method_model",
+        type=str,
+        default="none",
+        choices=["none", "m_bias", "m_emb", "m_pcafix", "m_pcainit"],
+        help=(
+            "How to incorporate per-method information. "
+            "'m_bias' = per-method bias vector added to node features; "
+            "'m_emb' = learned embedding + MLP; PCA: To do"
+        ),
+    )
+
+    parser.add_argument(
         "--num_methods",
         type=int,
         default=0,
-        help="Number of methods (for method embeddings). 0 disables method conditioning.",
+        help="Number of distinct DFT methods (for method_model != 'none').",
     )
     parser.add_argument(
         "--method_emb_dim",

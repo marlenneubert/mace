@@ -81,6 +81,7 @@ class MACE(torch.nn.Module):
         readout_cls: Optional[Type[NonLinearReadoutBlock]] = NonLinearReadoutBlock,
         num_methods: int = 0,
         method_emb_dim: int = 0,
+        method_model: str = "none",
     ):
         super().__init__()
         self.register_buffer(
@@ -106,12 +107,9 @@ class MACE(torch.nn.Module):
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
         ## add method embedding
+        self.method_model = method_model  # "none", "m_bias", "m_emb", ...
         self.num_methods = num_methods
         self.method_emb_dim = method_emb_dim
-        self.use_method_emb = (
-            (num_methods is not None and num_methods > 0)
-            and (method_emb_dim is not None and method_emb_dim > 0)
-        )
 
 
         # Embedding
@@ -125,18 +123,47 @@ class MACE(torch.nn.Module):
         embedding_size = node_feats_irreps.count(o3.Irrep(0, 1))
 
         self.embedding_size = embedding_size
-        if self.use_method_emb:
+
+        # --- method-model-specific parameters ---
+        if self.method_model == "m_bias":
+            if self.num_methods is None or self.num_methods <= 0:
+                raise ValueError("num_methods must be > 0 for method_model='m_bias'")
+            # e_m ∈ R^{embedding_size} per method
+            self.method_bias = torch.nn.Parameter(
+                torch.zeros(self.num_methods, embedding_size)
+            )
+            self.method_embedding = None
+            self.method_mlp = None
+
+        elif self.method_model == "m_emb":
+            if (
+                self.num_methods is None
+                or self.num_methods <= 0
+                or self.method_emb_dim is None
+                or self.method_emb_dim <= 0
+            ):
+                raise ValueError(
+                    "num_methods and method_emb_dim must be > 0 for method_model='m_emb'"
+                )
             # one embedding vector z_m per method
             self.method_embedding = torch.nn.Embedding(
-                num_embeddings=num_methods,
-                embedding_dim=method_emb_dim,
+                num_embeddings=self.num_methods,
+                embedding_dim=self.method_emb_dim,
             )
             # residual MLP: [s || z] -> delta_s (same dimension as scalars)
             self.method_mlp = torch.nn.Sequential(
-                torch.nn.Linear(embedding_size + method_emb_dim, embedding_size),
+                torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
                 torch.nn.SiLU(),
                 torch.nn.Linear(embedding_size, embedding_size),
             )
+            self.method_bias = None
+
+        else:
+            # no method conditioning
+            self.method_bias = None
+            self.method_embedding = None
+            self.method_mlp = None
+
 
 
 
@@ -346,18 +373,29 @@ class MACE(torch.nn.Module):
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
 
-        # add one-hot method embedding (Dral-style)
-        if self.use_method_emb:
-            # method_index: [n_graphs], long
-            method_idx = data["method_index"].to(torch.long)
-            # method embedding per graph: [n_graphs, method_emb_dim]
-            z_graph = self.method_embedding(method_idx)
-            # broadcast to nodes using batch: [n_nodes]
-            z_nodes = z_graph[data["batch"]]  # [n_nodes, method_emb_dim]
-            # concatenate scalar node features with method embedding
-            x = torch.cat([node_feats, z_nodes], dim=-1)  # [n_nodes, C0 + D_m]
-            delta = self.method_mlp(x)                    # [n_nodes, C0]
-            node_feats = node_feats + delta               # residual update
+        # --- method conditioning on initial scalar features ---
+        if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
+            # method_index is graph-level: [n_graphs]
+            method_idx_graph = data["method_index"].to(torch.long)
+            if method_idx_graph.dim() > 1:
+                method_idx_graph = method_idx_graph.squeeze(-1)
+
+            if self.method_model == "m_bias":
+                # e_m per method -> per graph -> per node
+                e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
+                e_nodes = e_graph[data["batch"]]                  # [n_nodes, C0]
+                node_feats = node_feats + e_nodes                 # s_i^(0) + e_m
+
+            elif self.method_model == "m_emb":
+                # learned embedding + MLP -> delta s_i
+                z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
+                z_nodes = z_graph[data["batch"]]                  # [n_nodes, D_m]
+                x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
+                delta = self.method_mlp(x)                        # [n_nodes, C0]
+                node_feats = node_feats + delta
+
+
+
 
         edge_attrs = self.spherical_harmonics(vectors)
         edge_feats, cutoff = self.radial_embedding(
@@ -541,15 +579,25 @@ class ScaleShiftMACE(MACE):
 
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
-        # add one-hot method embedding (Dral-style)
-        if self.use_method_emb:
-            print("DEBUG method_idx:", data["method_index"].shape, "batch:", data["batch"].shape)
-            method_idx = data["method_index"].to(torch.long)
-            z_graph = self.method_embedding(method_idx)   # [n_graphs, D_m]
-            z_nodes = z_graph[data["batch"]]             # [n_nodes, D_m]
-            x = torch.cat([node_feats, z_nodes], dim=-1) # [n_nodes, C0 + D_m]
-            delta = self.method_mlp(x)                   # [n_nodes, C0]
-            node_feats = node_feats + delta
+        
+        if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
+            method_idx_graph = data["method_index"].to(torch.long)
+            if method_idx_graph.dim() > 1:
+                method_idx_graph = method_idx_graph.squeeze(-1)
+
+            if self.method_model == "m_bias":
+                e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
+                e_nodes = e_graph[data["batch"]]                  # [n_nodes, C0]
+                node_feats = node_feats + e_nodes
+
+            elif self.method_model == "m_emb":
+                z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
+                z_nodes = z_graph[data["batch"]]                  # [n_nodes, D_m]
+                x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
+                delta = self.method_mlp(x)                        # [n_nodes, C0]
+                node_feats = node_feats + delta
+
+
 
         edge_attrs = self.spherical_harmonics(vectors)
         edge_feats, cutoff = self.radial_embedding(
