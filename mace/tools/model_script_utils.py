@@ -187,6 +187,7 @@ def configure_model(
             cueq_config=cueq_config,
             num_methods=getattr(args, "num_methods", 0),
             method_emb_dim=getattr(args, "method_emb_dim", 0),
+            method_model=getattr(args, "method_model", "none"),
         )
         model_config_foundation = None
 
