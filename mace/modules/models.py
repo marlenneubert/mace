@@ -382,6 +382,13 @@ class MACE(torch.nn.Module):
             batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
             # --- Sanity checks (helpful for our debugging) ---
+            print(
+                "DEBUG method_index batch:",
+                "min", int(method_idx_graph.min()),
+                "max", int(method_idx_graph.max()),
+                "num_methods", self.num_methods,
+            )      
+                  
             if method_idx_graph.numel() > 0:
                 min_idx = int(method_idx_graph.min())
                 max_idx = int(method_idx_graph.max())
@@ -604,6 +611,13 @@ class ScaleShiftMACE(MACE):
             batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
             # --- Sanity checks (helpful for our debugging) ---
+            print(
+                "DEBUG method_index batch:",
+                "min", int(method_idx_graph.min()),
+                "max", int(method_idx_graph.max()),
+                "num_methods", self.num_methods,
+            )
+
             if method_idx_graph.numel() > 0:
                 min_idx = int(method_idx_graph.min())
                 max_idx = int(method_idx_graph.max())
