@@ -142,6 +142,23 @@ class AtomicData(torch_geometric.data.Data):
         }
         super().__init__(**data, **extra_data)
 
+    ## add method_index support for batching
+    def __inc__(self, key, value):
+        # Do NOT cumulatively increment graph-level method labels across the batch
+        if key == "method_index":
+            return 0
+        # Fallback to the default behaviour for everything else
+        return super().__inc__(key, value)
+    
+    def __cat_dim__(self, key, value):
+        # For graph-level scalars like method_index, we concatenate along a new batch dim
+        if key == "method_index":
+            # This will be overwritten to None for 0-dim tensors in Batch.from_data_list,
+            # which then unsqueezes to shape [n_graphs].
+            return 0
+        return super().__cat_dim__(key, value)
+
+
     @classmethod
     def from_config(
         cls,
