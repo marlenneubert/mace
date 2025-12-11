@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from e3nn import o3
 from e3nn.util.jit import compile_mode
-
+from torch_scatter import scatter_min
 from mace.modules.embeddings import GenericJointEmbedding
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_mean, scatter_sum
@@ -373,27 +373,48 @@ class MACE(torch.nn.Module):
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
 
-        # --- method conditioning on initial scalar features ---
         if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
-            # method_index is graph-level: [n_graphs]
-            method_idx_graph = data["method_index"].to(torch.long)
-            if method_idx_graph.dim() > 1:
-                method_idx_graph = method_idx_graph.squeeze(-1)
+            method_idx = data["method_index"].to(torch.long)
 
+            # Squeeze trailing dim if it's [N,1]
+            if method_idx.dim() > 1:
+                method_idx = method_idx.squeeze(-1)
+
+            batch = data["batch"]
+            num_graphs = ctx.num_graphs
+
+            # If method_idx is node-level, compress to graph-level:
+            if method_idx.numel() == batch.numel():
+                # One method index per node, assume constant within graph
+                method_idx_graph, _ = scatter_min(method_idx, batch, dim=0)
+            else:
+                method_idx_graph = method_idx
+
+            # --- SANITY CHECKS ---
+            min_idx = int(method_idx_graph.min().item())
+            max_idx = int(method_idx_graph.max().item())
+            assert 0 <= min_idx, f"Negative method_index found: min={min_idx}"
+            assert max_idx < self.num_methods, (
+                f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
+            )
+
+            assert batch.max().item() < method_idx_graph.shape[0], (
+                f"batch index out of range: batch.max={batch.max().item()}, "
+                f"len(method_idx_graph)={method_idx_graph.shape[0]}"
+            )
+
+            # Now do the actual conditioning
             if self.method_model == "m_bias":
-                # e_m per method -> per graph -> per node
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
-                e_nodes = e_graph[data["batch"]]                  # [n_nodes, C0]
-                node_feats = node_feats + e_nodes                 # s_i^(0) + e_m
+                e_nodes = e_graph[batch]                          # [n_nodes, C0]
+                node_feats = node_feats + e_nodes
 
             elif self.method_model == "m_emb":
-                # learned embedding + MLP -> delta s_i
                 z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
-                z_nodes = z_graph[data["batch"]]                  # [n_nodes, D_m]
+                z_nodes = z_graph[batch]                          # [n_nodes, D_m]
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
                 delta = self.method_mlp(x)                        # [n_nodes, C0]
                 node_feats = node_feats + delta
-
 
 
 
@@ -581,18 +602,44 @@ class ScaleShiftMACE(MACE):
         node_feats = self.node_embedding(data["node_attrs"])
         
         if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
-            method_idx_graph = data["method_index"].to(torch.long)
-            if method_idx_graph.dim() > 1:
-                method_idx_graph = method_idx_graph.squeeze(-1)
+            method_idx = data["method_index"].to(torch.long)
 
+            # Squeeze trailing dim if it's [N,1]
+            if method_idx.dim() > 1:
+                method_idx = method_idx.squeeze(-1)
+
+            batch = data["batch"]
+            num_graphs = ctx.num_graphs
+
+            # If method_idx is node-level, compress to graph-level:
+            if method_idx.numel() == batch.numel():
+                # One method index per node, assume constant within graph
+                method_idx_graph, _ = scatter_min(method_idx, batch, dim=0)
+            else:
+                method_idx_graph = method_idx
+
+            # --- SANITY CHECKS ---
+            min_idx = int(method_idx_graph.min().item())
+            max_idx = int(method_idx_graph.max().item())
+            assert 0 <= min_idx, f"Negative method_index found: min={min_idx}"
+            assert max_idx < self.num_methods, (
+                f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
+            )
+
+            assert batch.max().item() < method_idx_graph.shape[0], (
+                f"batch index out of range: batch.max={batch.max().item()}, "
+                f"len(method_idx_graph)={method_idx_graph.shape[0]}"
+            )
+
+            # Now do the actual conditioning
             if self.method_model == "m_bias":
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
-                e_nodes = e_graph[data["batch"]]                  # [n_nodes, C0]
+                e_nodes = e_graph[batch]                          # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
 
             elif self.method_model == "m_emb":
                 z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
-                z_nodes = z_graph[data["batch"]]                  # [n_nodes, D_m]
+                z_nodes = z_graph[batch]                          # [n_nodes, D_m]
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
                 delta = self.method_mlp(x)                        # [n_nodes, C0]
                 node_feats = node_feats + delta
