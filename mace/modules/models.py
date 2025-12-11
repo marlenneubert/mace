@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from e3nn import o3
 from e3nn.util.jit import compile_mode
-from torch_scatter import scatter_min
+
 from mace.modules.embeddings import GenericJointEmbedding
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_mean, scatter_sum
@@ -374,37 +374,32 @@ class MACE(torch.nn.Module):
         node_feats = self.node_embedding(data["node_attrs"])
 
         if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
-            method_idx = data["method_index"].to(torch.long)
+            # method_index is graph-level: [n_graphs] or [n_graphs, 1]
+            method_idx_graph = data["method_index"].to(torch.long)
+            if method_idx_graph.dim() > 1:
+                method_idx_graph = method_idx_graph.squeeze(-1)
 
-            # Squeeze trailing dim if it's [N,1]
-            if method_idx.dim() > 1:
-                method_idx = method_idx.squeeze(-1)
+            batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
-            batch = data["batch"]
-            num_graphs = ctx.num_graphs
+            # --- Sanity checks (helpful for our debugging) ---
+            if method_idx_graph.numel() > 0:
+                min_idx = int(method_idx_graph.min())
+                max_idx = int(method_idx_graph.max())
+                assert 0 <= min_idx, f"Negative method_index: min={min_idx}"
+                assert max_idx < self.num_methods, (
+                    f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
+                )
 
-            # If method_idx is node-level, compress to graph-level:
-            if method_idx.numel() == batch.numel():
-                # One method index per node, assume constant within graph
-                method_idx_graph, _ = scatter_min(method_idx, batch, dim=0)
-            else:
-                method_idx_graph = method_idx
+            if batch.numel() > 0:
+                max_b = int(batch.max())
+                assert max_b < method_idx_graph.shape[0], (
+                    f"batch index out of range: batch.max={max_b}, "
+                    f"n_graphs_in_batch={method_idx_graph.shape[0]}"
+                )
 
-            # --- SANITY CHECKS ---
-            min_idx = int(method_idx_graph.min().item())
-            max_idx = int(method_idx_graph.max().item())
-            assert 0 <= min_idx, f"Negative method_index found: min={min_idx}"
-            assert max_idx < self.num_methods, (
-                f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
-            )
-
-            assert batch.max().item() < method_idx_graph.shape[0], (
-                f"batch index out of range: batch.max={batch.max().item()}, "
-                f"len(method_idx_graph)={method_idx_graph.shape[0]}"
-            )
-
-            # Now do the actual conditioning
+            # --- Actual method conditioning ---
             if self.method_model == "m_bias":
+                # e_m per method -> per graph -> per node
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
                 e_nodes = e_graph[batch]                          # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
@@ -415,7 +410,6 @@ class MACE(torch.nn.Module):
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
                 delta = self.method_mlp(x)                        # [n_nodes, C0]
                 node_feats = node_feats + delta
-
 
 
         edge_attrs = self.spherical_harmonics(vectors)
@@ -600,39 +594,34 @@ class ScaleShiftMACE(MACE):
 
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
-        
+
         if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
-            method_idx = data["method_index"].to(torch.long)
+            # method_index is graph-level: [n_graphs] or [n_graphs, 1]
+            method_idx_graph = data["method_index"].to(torch.long)
+            if method_idx_graph.dim() > 1:
+                method_idx_graph = method_idx_graph.squeeze(-1)
 
-            # Squeeze trailing dim if it's [N,1]
-            if method_idx.dim() > 1:
-                method_idx = method_idx.squeeze(-1)
+            batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
-            batch = data["batch"]
-            num_graphs = ctx.num_graphs
+            # --- Sanity checks (helpful for our debugging) ---
+            if method_idx_graph.numel() > 0:
+                min_idx = int(method_idx_graph.min())
+                max_idx = int(method_idx_graph.max())
+                assert 0 <= min_idx, f"Negative method_index: min={min_idx}"
+                assert max_idx < self.num_methods, (
+                    f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
+                )
 
-            # If method_idx is node-level, compress to graph-level:
-            if method_idx.numel() == batch.numel():
-                # One method index per node, assume constant within graph
-                method_idx_graph, _ = scatter_min(method_idx, batch, dim=0)
-            else:
-                method_idx_graph = method_idx
+            if batch.numel() > 0:
+                max_b = int(batch.max())
+                assert max_b < method_idx_graph.shape[0], (
+                    f"batch index out of range: batch.max={max_b}, "
+                    f"n_graphs_in_batch={method_idx_graph.shape[0]}"
+                )
 
-            # --- SANITY CHECKS ---
-            min_idx = int(method_idx_graph.min().item())
-            max_idx = int(method_idx_graph.max().item())
-            assert 0 <= min_idx, f"Negative method_index found: min={min_idx}"
-            assert max_idx < self.num_methods, (
-                f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
-            )
-
-            assert batch.max().item() < method_idx_graph.shape[0], (
-                f"batch index out of range: batch.max={batch.max().item()}, "
-                f"len(method_idx_graph)={method_idx_graph.shape[0]}"
-            )
-
-            # Now do the actual conditioning
+            # --- Actual method conditioning ---
             if self.method_model == "m_bias":
+                # e_m per method -> per graph -> per node
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
                 e_nodes = e_graph[batch]                          # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
@@ -643,7 +632,6 @@ class ScaleShiftMACE(MACE):
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
                 delta = self.method_mlp(x)                        # [n_nodes, C0]
                 node_feats = node_feats + delta
-
 
 
         edge_attrs = self.spherical_harmonics(vectors)
