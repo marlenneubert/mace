@@ -412,6 +412,7 @@ class MACE(torch.nn.Module):
                 node_feats = node_feats + e_nodes
 
             elif self.method_model == "m_emb":
+                print('DEBUG: use method embedding forward')
                 z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
                 z_nodes = z_graph[batch]                          # [n_nodes, D_m]
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
@@ -641,6 +642,7 @@ class ScaleShiftMACE(MACE):
                 node_feats = node_feats + e_nodes
 
             elif self.method_model == "m_emb":
+                print('DEBUG: use method embedding forward')
                 z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
                 z_nodes = z_graph[batch]                          # [n_nodes, D_m]
                 x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
