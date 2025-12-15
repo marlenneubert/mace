@@ -82,6 +82,8 @@ class MACE(torch.nn.Module):
         num_methods: int = 0,
         method_emb_dim: int = 0,
         method_model: str = "none",
+        method_pca_init: Optional[np.ndarray] = None,
+        method_injector: str = "resmlp",
     ):
         super().__init__()
         self.register_buffer(
@@ -110,6 +112,11 @@ class MACE(torch.nn.Module):
         self.method_model = method_model  # "none", "m_bias", "m_emb", ...
         self.num_methods = num_methods
         self.method_emb_dim = method_emb_dim
+        self.method_pca_init = method_pca_init
+        self.method_injector = method_injector
+        self.method_gamma = None
+        self.method_beta = None
+
 
 
         # Embedding
@@ -129,11 +136,13 @@ class MACE(torch.nn.Module):
             if self.num_methods is None or self.num_methods <= 0:
                 raise ValueError("num_methods must be > 0 for method_model='m_bias'")
             # e_m ∈ R^{embedding_size} per method
-            self.method_bias = torch.nn.Parameter(
-                torch.zeros(self.num_methods, embedding_size)
-            )
+            self.method_bias = torch.nn.Parameter(torch.zeros(self.num_methods, embedding_size))
             self.method_embedding = None
+            self.method_pca_table = None
+            self.method_pca = None
             self.method_mlp = None
+            self.method_gamma = None
+            self.method_beta = None
 
         elif self.method_model == "m_emb":
             if (
@@ -142,27 +151,105 @@ class MACE(torch.nn.Module):
                 or self.method_emb_dim is None
                 or self.method_emb_dim <= 0
             ):
-                raise ValueError(
-                    "num_methods and method_emb_dim must be > 0 for method_model='m_emb'"
-                )
+                raise ValueError("num_methods and method_emb_dim must be > 0 for method_model='m_emb'")
+
+            self.method_bias = None
+            self.method_pca_table = None
+            self.method_pca = None
+
             # one embedding vector z_m per method
             self.method_embedding = torch.nn.Embedding(
                 num_embeddings=self.num_methods,
                 embedding_dim=self.method_emb_dim,
             )
-            # residual MLP: [s || z] -> delta_s (same dimension as scalars)
-            self.method_mlp = torch.nn.Sequential(
-                torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
-                torch.nn.SiLU(),
-                torch.nn.Linear(embedding_size, embedding_size),
-            )
+
+            if self.method_injector == "resmlp":
+                # residual MLP: [s || z] -> delta_s
+                self.method_mlp = torch.nn.Sequential(
+                    torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(embedding_size, embedding_size),
+                )
+                self.method_gamma = None
+                self.method_beta = None
+
+            elif self.method_injector == "film":
+                # strict FiLM: s <- (1 + g(z)) * s + b(z)
+                self.method_mlp = None
+                self.method_gamma = torch.nn.Linear(self.method_emb_dim, embedding_size)
+                self.method_beta = torch.nn.Linear(self.method_emb_dim, embedding_size)
+
+                # identity init: g(z)=0, b(z)=0 => gamma=1, beta=0 initially
+                torch.nn.init.zeros_(self.method_gamma.weight)
+                torch.nn.init.zeros_(self.method_gamma.bias)
+                torch.nn.init.zeros_(self.method_beta.weight)
+                torch.nn.init.zeros_(self.method_beta.bias)
+
+            else:
+                raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
+        elif self.method_model in ("m_pcafix", "m_pcainit"):
+            if self.num_methods is None or self.num_methods <= 0:
+                raise ValueError("num_methods must be > 0 for m_pcafix/m_pcainit")
+            if method_pca_init is None:
+                raise ValueError("method_pca_init must be provided for m_pcafix/m_pcainit")
+
             self.method_bias = None
+            self.method_embedding = None
+
+            pca = torch.tensor(method_pca_init, dtype=torch.get_default_dtype())
+            #pca = torch.as_tensor(method_pca_init, dtype=torch.get_default_dtype())
+            if pca.ndim != 2:
+                raise ValueError(f"method_pca_init must be 2D, got shape {tuple(pca.shape)}")
+            if pca.shape[0] != self.num_methods:
+                raise ValueError(f"method_pca_init rows {pca.shape[0]} != num_methods {self.num_methods}")
+
+            pca_dim = pca.shape[1]
+            if self.method_emb_dim is None or self.method_emb_dim <= 0:
+                self.method_emb_dim = pca_dim
+            elif self.method_emb_dim != pca_dim:
+                raise ValueError(f"method_emb_dim {self.method_emb_dim} != pca_dim {pca_dim}")
+
+            if self.method_model == "m_pcafix":
+                self.register_buffer("method_pca_table", pca)
+                self.method_pca = None
+            else:  # m_pcainit
+                self.method_pca_table = None
+                self.method_pca = torch.nn.Parameter(pca.clone())
+
+            if self.method_injector == "resmlp":
+                self.method_mlp = torch.nn.Sequential(
+                    torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(embedding_size, embedding_size),
+                )
+                self.method_gamma = None
+                self.method_beta = None
+
+            elif self.method_injector == "film":
+                self.method_mlp = None
+                self.method_gamma = torch.nn.Linear(self.method_emb_dim, embedding_size)
+                self.method_beta = torch.nn.Linear(self.method_emb_dim, embedding_size)
+
+                # identity init
+                torch.nn.init.zeros_(self.method_gamma.weight)
+                torch.nn.init.zeros_(self.method_gamma.bias)
+                torch.nn.init.zeros_(self.method_beta.weight)
+                torch.nn.init.zeros_(self.method_beta.bias)
+
+            else:
+                raise ValueError(f"Unknown method_injector: {self.method_injector}")
 
         else:
             # no method conditioning
             self.method_bias = None
             self.method_embedding = None
+            self.method_pca_table = None
+            self.method_pca = None
             self.method_mlp = None
+            self.method_gamma = None
+            self.method_beta = None
+
 
 
 
@@ -373,7 +460,7 @@ class MACE(torch.nn.Module):
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
 
-        if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
+        if "method_index" in data and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit"):
             # method_index is graph-level: [n_graphs] or [n_graphs, 1]
             method_idx_graph = data["method_index"].to(torch.long)
             if method_idx_graph.dim() > 1:
@@ -381,43 +468,40 @@ class MACE(torch.nn.Module):
 
             batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
-            # --- Sanity checks (helpful for our debugging) ---
-            print(
-                "DEBUG method_index batch:",
-                "min", int(method_idx_graph.min()),
-                "max", int(method_idx_graph.max()),
-                "num_methods", self.num_methods,
-            )      
-                  
-            if method_idx_graph.numel() > 0:
-                min_idx = int(method_idx_graph.min())
-                max_idx = int(method_idx_graph.max())
-                assert 0 <= min_idx, f"Negative method_index: min={min_idx}"
-                assert max_idx < self.num_methods, (
-                    f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
-                )
-
-            if batch.numel() > 0:
-                max_b = int(batch.max())
-                assert max_b < method_idx_graph.shape[0], (
-                    f"batch index out of range: batch.max={max_b}, "
-                    f"n_graphs_in_batch={method_idx_graph.shape[0]}"
-                )
-
-            # --- Actual method conditioning ---
             if self.method_model == "m_bias":
                 # e_m per method -> per graph -> per node
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
                 e_nodes = e_graph[batch]                          # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
 
-            elif self.method_model == "m_emb":
-                print('DEBUG: use method embedding forward')
-                z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
-                z_nodes = z_graph[batch]                          # [n_nodes, D_m]
-                x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
-                delta = self.method_mlp(x)                        # [n_nodes, C0]
-                node_feats = node_feats + delta
+            else:
+                # get method vector z_m per graph
+                if self.method_model == "m_emb":
+                    z_graph = self.method_embedding(method_idx_graph)      # [n_graphs, D_m]
+                elif self.method_model == "m_pcafix":
+                    z_graph = self.method_pca_table[method_idx_graph]      # [n_graphs, D_m]
+                else:  # "m_pcainit"
+                    z_graph = self.method_pca[method_idx_graph]            # [n_graphs, D_m]
+
+                if self.method_injector == "resmlp":
+                    # broadcast to nodes
+                    z_nodes = z_graph[batch]  # [n_nodes, D_m]
+                    x = torch.cat([node_feats, z_nodes.to(node_feats.dtype)], dim=-1)  # [n_nodes, C0 + D_m]
+                    delta = self.method_mlp(x)  # [n_nodes, C0]
+                    node_feats = node_feats + delta
+
+                elif self.method_injector == "film":
+                    # strict FiLM: s <- (1 + g(z)) * s + b(z)
+                    gamma_graph = 1.0 + self.method_gamma(z_graph)         # [n_graphs, C0]
+                    beta_graph  = self.method_beta(z_graph)                # [n_graphs, C0]
+                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)   # [n_nodes, C0]
+                    beta_nodes  = beta_graph[batch].to(node_feats.dtype)    # [n_nodes, C0]
+                    node_feats = gamma_nodes * node_feats + beta_nodes
+
+                else:
+                    raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
+
 
 
         edge_attrs = self.spherical_harmonics(vectors)
@@ -603,7 +687,8 @@ class ScaleShiftMACE(MACE):
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
 
-        if "method_index" in data and self.method_model in ("m_bias", "m_emb"):
+
+        if "method_index" in data and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit"):
             # method_index is graph-level: [n_graphs] or [n_graphs, 1]
             method_idx_graph = data["method_index"].to(torch.long)
             if method_idx_graph.dim() > 1:
@@ -611,43 +696,39 @@ class ScaleShiftMACE(MACE):
 
             batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
 
-            # --- Sanity checks (helpful for our debugging) ---
-            print(
-                "DEBUG method_index batch:",
-                "min", int(method_idx_graph.min()),
-                "max", int(method_idx_graph.max()),
-                "num_methods", self.num_methods,
-            )
-
-            if method_idx_graph.numel() > 0:
-                min_idx = int(method_idx_graph.min())
-                max_idx = int(method_idx_graph.max())
-                assert 0 <= min_idx, f"Negative method_index: min={min_idx}"
-                assert max_idx < self.num_methods, (
-                    f"method_index out of range: max={max_idx}, num_methods={self.num_methods}"
-                )
-
-            if batch.numel() > 0:
-                max_b = int(batch.max())
-                assert max_b < method_idx_graph.shape[0], (
-                    f"batch index out of range: batch.max={max_b}, "
-                    f"n_graphs_in_batch={method_idx_graph.shape[0]}"
-                )
-
-            # --- Actual method conditioning ---
             if self.method_model == "m_bias":
                 # e_m per method -> per graph -> per node
                 e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
                 e_nodes = e_graph[batch]                          # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
 
-            elif self.method_model == "m_emb":
-                print('DEBUG: use method embedding forward')
-                z_graph = self.method_embedding(method_idx_graph) # [n_graphs, D_m]
-                z_nodes = z_graph[batch]                          # [n_nodes, D_m]
-                x = torch.cat([node_feats, z_nodes], dim=-1)      # [n_nodes, C0 + D_m]
-                delta = self.method_mlp(x)                        # [n_nodes, C0]
-                node_feats = node_feats + delta
+            else:
+                # get method vector z_m per graph
+                if self.method_model == "m_emb":
+                    z_graph = self.method_embedding(method_idx_graph)      # [n_graphs, D_m]
+                elif self.method_model == "m_pcafix":
+                    z_graph = self.method_pca_table[method_idx_graph]      # [n_graphs, D_m]
+                else:  # "m_pcainit"
+                    z_graph = self.method_pca[method_idx_graph]            # [n_graphs, D_m]
+
+                if self.method_injector == "resmlp":
+                    # broadcast to nodes
+                    z_nodes = z_graph[batch]  # [n_nodes, D_m]
+                    x = torch.cat([node_feats, z_nodes.to(node_feats.dtype)], dim=-1)  # [n_nodes, C0 + D_m]
+                    delta = self.method_mlp(x)  # [n_nodes, C0]
+                    node_feats = node_feats + delta
+
+                elif self.method_injector == "film":
+                    # strict FiLM: s <- (1 + g(z)) * s + b(z)
+                    gamma_graph = 1.0 + self.method_gamma(z_graph)         # [n_graphs, C0]
+                    beta_graph  = self.method_beta(z_graph)                # [n_graphs, C0]
+                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)   # [n_nodes, C0]
+                    beta_nodes  = beta_graph[batch].to(node_feats.dtype)    # [n_nodes, C0]
+                    node_feats = gamma_nodes * node_feats + beta_nodes
+
+                else:
+                    raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
 
 
         edge_attrs = self.spherical_harmonics(vectors)

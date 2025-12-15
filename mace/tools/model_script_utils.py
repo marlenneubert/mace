@@ -188,8 +188,20 @@ def configure_model(
             num_methods=getattr(args, "num_methods", 0),
             method_emb_dim=getattr(args, "method_emb_dim", 0),
             method_model=getattr(args, "method_model", "none"),
+            method_injector=getattr(args, "method_injector", "resmlp")
         )
         model_config_foundation = None
+
+        if args.method_model in ("m_pcafix", "m_pcainit"):
+            if args.method_pca_file is None:
+                raise ValueError("method_pca_file must be set for m_pcafix/m_pcainit")
+            pca = np.load(args.method_pca_file)  # [num_methods, pca_dim]
+            if args.num_methods is not None and pca.shape[0] != args.num_methods:
+                raise ValueError(f"method_pca_file rows {pca.shape[0]} != num_methods {args.num_methods}")
+            if args.method_emb_dim is not None and args.method_emb_dim > 0 and pca.shape[1] != args.method_emb_dim:
+                raise ValueError(f"method_pca_file dim {pca.shape[1]} != method_emb_dim {args.method_emb_dim}")
+            model_config["method_pca_init"] = pca #torch.tensor(pca, dtype=torch.get_default_dtype())
+
 
     model = _build_model(args, model_config, model_config_foundation, heads)
 

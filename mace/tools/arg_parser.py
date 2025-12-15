@@ -365,6 +365,27 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Dimension of method embedding. 0 disables method conditioning.",
     )
 
+    parser.add_argument(
+        "--method_pca_file",
+        type=str,
+        default=None,
+        help="Path to method PCA table .npy of shape [num_methods, pca_dim]. Required for m_pcafix/m_pcainit.",
+    )
+
+    parser.add_argument(
+        "--method_injector",
+        type=str,
+        default="resmlp",
+        choices=["resmlp", "film"],
+        help=(
+            "How to inject method vector z_m into node scalar features. "
+            "'resmlp' = residual MLP on [s||z]; "
+            "'film' = strict FiLM: s <- (1+g(z))*s + b(z) with identity init."
+        ),
+    )
+
+
+
     # Dataset
     parser.add_argument(
         "--train_file",
