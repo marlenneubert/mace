@@ -188,7 +188,9 @@ def configure_model(
             num_methods=getattr(args, "num_methods", 0),
             method_emb_dim=getattr(args, "method_emb_dim", 0),
             method_model=getattr(args, "method_model", "none"),
-            method_injector=getattr(args, "method_injector", "resmlp")
+            method_injector=getattr(args, "method_injector", "resmlp"),
+            method_pca_file=getattr(args, "method_pca_file", None),
+            method_pca_init=None,
         )
         model_config_foundation = None
 
