@@ -845,6 +845,73 @@ def get_params_options(
                 "weight_decay": 0.0,
             }
         )
+
+    ### add method conditioning parameters
+    method_param_groups = []
+    # m_bias
+    if hasattr(model, "method_bias") and model.method_bias is not None:
+        method_param_groups.append(
+            {
+                "name": "method_bias",
+                "params": [model.method_bias],
+                "weight_decay": 0.0,  # like embeddings
+            }
+        )
+
+    # m_emb
+    if hasattr(model, "method_embedding") and model.method_embedding is not None:
+        method_param_groups.append(
+            {
+                "name": "method_embedding",
+                "params": model.method_embedding.parameters(),
+                "weight_decay": 0.0, 
+            }
+        )
+
+    # m_pcainit (trainable PCA table)
+    if hasattr(model, "method_pca") and model.method_pca is not None:
+        method_param_groups.append(
+            {
+                "name": "method_pca",
+                "params": [model.method_pca],
+                "weight_decay": 0.0,  # like embedding table
+            }
+        )
+
+    # resmlp injector (m_emb / m_pcafix / m_pcainit)
+    if hasattr(model, "method_mlp") and model.method_mlp is not None:
+        method_param_groups.append(
+            {
+                "name": "method_mlp",
+                "params": model.method_mlp.parameters(),
+                "weight_decay": args.weight_decay,
+            }
+        )
+
+    # film injector (m_emb / m_pcafix / m_pcainit)
+    # (gamma/beta are Linear layers)
+    if hasattr(model, "method_gamma") and model.method_gamma is not None:
+        method_param_groups.append(
+            {
+                "name": "method_gamma",
+                "params": model.method_gamma.parameters(),
+                "weight_decay": args.weight_decay,
+            }
+        )
+    if hasattr(model, "method_beta") and model.method_beta is not None:
+        method_param_groups.append(
+            {
+                "name": "method_beta",
+                "params": model.method_beta.parameters(),
+                "weight_decay": args.weight_decay,
+            }
+        )
+
+    # Only add if non-empty
+    if len(method_param_groups) > 0:
+        param_options["params"].extend(method_param_groups)    
+
+
     return param_options
 
 

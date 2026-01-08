@@ -740,37 +740,10 @@ def run(args) -> None:
     optimizer = get_optimizer(args, param_options)
 
     # --- Ensure method-conditioning parameters optimized ---
-    if getattr(args, "method_model", "none") != "none":
-        existing = {id(p) for g in optimizer.param_groups for p in g["params"]}
-        missing_named = [
-            (name, p)
-            for name, p in model.named_parameters()
-            if name.startswith("method_") and p.requires_grad and id(p) not in existing
-        ]
-        if missing_named:
-            import logging
-            logging.warning(
-                "Adding %d missing method_* params to optimizer: %s",
-                len(missing_named),
-                ", ".join(n for n, _ in missing_named),
-            )
-            optimizer.add_param_group(
-                {
-                    "params": [p for _, p in missing_named],
-                    "lr": args.lr,
-                    "weight_decay": args.weight_decay,
-                }
-            )
-    # check
-    def _in_optimizer(param, opt):
-        return any(param is p for g in opt.param_groups for p in g["params"])
+    opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
+    missing = [n for n,p in model.named_parameters() if p.requires_grad and id(p) not in opt_ids]
+    assert not missing, f"Trainable parameters missing from optimizer: {missing}"
 
-    if getattr(model, "method_pca", None) is not None:
-        print("method_pca in optimizer:", _in_optimizer(model.method_pca, optimizer))
-    if getattr(model, "method_bias", None) is not None:
-        print("method_bias in optimizer:", _in_optimizer(model.method_bias, optimizer))
-    if getattr(model, "method_embedding", None) is not None:
-        print("method_embedding.weight in optimizer:", _in_optimizer(model.method_embedding.weight, optimizer))
     
 
 
