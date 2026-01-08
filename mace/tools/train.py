@@ -145,6 +145,46 @@ def valid_err_log(
             f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A, RMSE_Mu_per_atom={error_mu:8.2f} mDebye",
         )
 
+# helper functions for mpcainit regularizer
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def _method_pca_reg_term(model: torch.nn.Module) -> Optional[torch.Tensor]:
+    """
+    Returns mean((method_pca - method_pca_ref)^2) if available, else None.
+    """
+    base = _unwrap_model(model)
+
+    if getattr(base, "method_model", "none") != "m_pcainit":
+        return None
+
+    method_pca = getattr(base, "method_pca", None)
+    method_pca_ref = getattr(base, "method_pca_ref", None)
+    if method_pca is None or method_pca_ref is None:
+        return None
+
+    # If frozen (requires_grad False), reg is constant -> skip to avoid shifting logged loss.
+    if not method_pca.requires_grad:
+        return None
+
+    return (method_pca - method_pca_ref).pow(2).mean()
+
+
+def _apply_method_pca_freeze(model: torch.nn.Module, freeze: bool) -> None:
+    """
+    Freeze/unfreeze method_pca by toggling requires_grad.
+    This avoids LR-scheduler interactions and works cleanly with your evaluate() which toggles grads.
+    """
+    base = _unwrap_model(model)
+    if getattr(base, "method_model", "none") != "m_pcainit":
+        return
+    method_pca = getattr(base, "method_pca", None)
+    if method_pca is None:
+        return
+    method_pca.requires_grad_(not freeze)
+
+
 
 def train(
     model: torch.nn.Module,
@@ -172,6 +212,8 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    method_pca_reg_weight: float = 0.0,
+    method_pca_freeze_epochs: int = 0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -224,6 +266,12 @@ def train(
             if epoch > start_epoch:
                 swa.scheduler.step()
 
+        # optional: freeze method_pca for first N epochs (mpcainit regularizer)
+        if method_pca_freeze_epochs and method_pca_freeze_epochs > 0:
+            freeze_now = epoch < method_pca_freeze_epochs
+            model_to_freeze = model if distributed_model is None else distributed_model
+            _apply_method_pca_freeze(model_to_freeze, freeze=freeze_now)
+
         # Train
         if distributed:
             train_sampler.set_epoch(epoch)
@@ -243,6 +291,7 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            method_pca_reg_weight=method_pca_reg_weight,
         )
         if distributed:
             torch.distributed.barrier()
@@ -361,6 +410,7 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    method_pca_reg_weight: float = 0.0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -376,6 +426,7 @@ def train_one_epoch(
             device=device,
             distributed=distributed,
             rank=rank,
+            method_pca_reg_weight=method_pca_reg_weight,
         )
         opt_metrics["mode"] = "opt"
         opt_metrics["epoch"] = epoch
@@ -392,6 +443,7 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                method_pca_reg_weight=method_pca_reg_weight,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -408,6 +460,7 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    method_pca_reg_weight: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -423,6 +476,12 @@ def take_step(
             compute_stress=output_args["stress"],
         )
         loss = loss_fn(pred=output, ref=batch)
+        if method_pca_reg_weight > 0.0:
+            reg = _method_pca_reg_term(model)
+            if reg is not None:
+                loss = loss + method_pca_reg_weight * reg
+
+
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -454,6 +513,7 @@ def take_step_lbfgs(
     device: torch.device,
     distributed: bool,
     rank: int,
+    method_pca_reg_weight: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     logging.debug(
@@ -501,6 +561,14 @@ def take_step_lbfgs(
 
             batch_loss.backward()
             total_loss += batch_loss
+
+        if method_pca_reg_weight > 0.0:
+            reg = _method_pca_reg_term(model)
+            if reg is not None:
+                scaled_reg = method_pca_reg_weight * reg
+                scaled_reg.backward()
+                total_loss = total_loss + scaled_reg.detach()
+        
 
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)

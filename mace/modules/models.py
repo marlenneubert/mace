@@ -216,6 +216,8 @@ class MACE(torch.nn.Module):
             else:  # m_pcainit
                 self.method_pca_table = None
                 self.method_pca = torch.nn.Parameter(pca.clone())
+                # for regularizer
+                self.register_buffer("method_pca_ref", pca.clone())
 
             if self.method_injector == "resmlp":
                 self.method_mlp = torch.nn.Sequential(

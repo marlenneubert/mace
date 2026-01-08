@@ -383,6 +383,10 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "'film' = strict FiLM: s <- (1+g(z))*s + b(z) with identity init."
         ),
     )
+    # pcainit regularizer
+    parser.add_argument("--method_pca_reg_weight", type=float, default=0.0)
+    parser.add_argument("--method_pca_freeze_epochs", type=int, default=0)
+
 
 
 

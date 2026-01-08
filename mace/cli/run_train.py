@@ -887,6 +887,9 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        method_pca_reg_weight=getattr(args, "method_pca_reg_weight", 0.0),
+        method_pca_freeze_epochs=getattr(args, "method_pca_freeze_epochs", 0),
+
     )
 
     logging.info("")
