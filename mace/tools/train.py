@@ -169,8 +169,8 @@ def _method_pca_reg_term(model: torch.nn.Module) -> Optional[torch.Tensor]:
         return None
 
     # check
-    reg_value = ((method_pca - method_pca_ref) ** 2).mean()
-    print('Regularizer value:', reg_value.item())
+    # reg_value = ((method_pca - method_pca_ref) ** 2).mean()
+    # print('Regularizer value:', reg_value.item())
 
     return (method_pca - method_pca_ref).pow(2).mean()
 
@@ -482,7 +482,7 @@ def take_step(
         loss = loss_fn(pred=output, ref=batch)
         if method_pca_reg_weight > 0.0:
             reg = _method_pca_reg_term(model)
-            print('PCA regularizer term:', reg)
+            # print('PCA regularizer term:', reg)
             if reg is not None:
                 loss = loss + method_pca_reg_weight * reg
 
