@@ -179,12 +179,14 @@ def run(args: argparse.Namespace) -> None:
 
     # check for method conditioning
     if getattr(model, "method_model", "none") != "none":
-        for i, cfg in enumerate(configs):
-            if "method_index" not in cfg:
-                raise ValueError(
-                    f"Config {i} has no method_index, but model.method_model={model.method_model}. "
-                    "Eval would silently ignore method conditioning."
-                )
+        first_batch = next(iter(data_loader))
+        if not hasattr(first_batch, "method_index") and "method_index" not in first_batch:
+            raise ValueError(
+                f"Model uses method conditioning (method_model={model.method_model}) "
+                "but eval batch has no 'method_index'. "
+                "Eval would silently ignore method conditioning. "
+            )
+
 
     # Collect data
     energies_list = []
