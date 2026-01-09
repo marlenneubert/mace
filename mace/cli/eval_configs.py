@@ -150,6 +150,16 @@ def run(args: argparse.Namespace) -> None:
     for param in model.parameters():
         param.requires_grad = False
 
+    # check for method conditioning
+    if getattr(model, "method_model", "none") != "none":
+        for i, cfg in enumerate(configs):
+            if "method_index" not in cfg:
+                raise ValueError(
+                    f"Config {i} has no method_index, but model.method_model={model.method_model}. "
+                    "Eval would silently ignore method conditioning."
+                )
+
+
     # Load data and prepare input
     atoms_list = ase.io.read(args.configs, index=":")
     if args.head is not None:
