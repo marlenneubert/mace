@@ -17,7 +17,7 @@ from mace import data
 from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
 from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
-
+from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -338,7 +338,12 @@ def run(args: argparse.Namespace) -> None:
             atoms.arrays[args.info_prefix + "node_energies"] = node_energies[i]
 
     # Write atoms to output path
-    ase.io.write(args.output, images=atoms_list, format="extxyz")
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ase.io.write(str(out_path), images=atoms_list, format="extxyz")
+
+    #ase.io.write(args.output, images=atoms_list, format="extxyz")
 
 
 if __name__ == "__main__":
