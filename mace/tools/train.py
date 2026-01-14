@@ -11,6 +11,8 @@ from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from numbers import Number
+
 import numpy as np
 import torch
 import torch.distributed
@@ -45,6 +47,19 @@ class SWAContainer:
     start: int
     loss_fn: torch.nn.Module
 
+def _wandb_scalar(x):
+    """Convert numeric-like values to a Python float for wandb; otherwise return None."""
+    if x is None:
+        return None
+    if isinstance(x, Number):
+        return float(x)
+    if torch.is_tensor(x):
+        return x.detach().cpu().item()
+    # Catch placeholders / non-serializable objects
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 def valid_err_log(
     valid_loss,
@@ -311,7 +326,8 @@ def train(
             if "ScheduleFree" in type(optimizer).__name__:
                 optimizer.eval()
             with param_context:
-                wandb_log_dict = {}
+                wandb_log_flat = {"epoch": epoch}
+
                 for valid_loader_name, valid_loader in valid_loaders.items():
                     valid_loss_head, eval_metrics = evaluate(
                         model=model_to_evaluate,
@@ -330,14 +346,26 @@ def train(
                             valid_loader_name,
                         )
                         if log_wandb:
-                            wandb_log_dict[valid_loader_name] = {
-                                "epoch": epoch,
-                                "valid_loss": valid_loss_head,
-                                "valid_rmse_e_per_atom": eval_metrics[
-                                    "rmse_e_per_atom"
-                                ],
-                                "valid_rmse_f": eval_metrics["rmse_f"],
-                            }
+                            rmse_e_pa = _wandb_scalar(eval_metrics.get("rmse_e_per_atom"))
+                            mae_e_pa = _wandb_scalar(eval_metrics.get("mae_e_per_atom"))
+                            mae_e = _wandb_scalar(eval_metrics.get("mae_e"))
+                            rmse_f = _wandb_scalar(eval_metrics.get("rmse_f"))
+
+                            wandb_log_flat[f"{valid_loader_name}/valid_loss"] = float(valid_loss_head)
+                            if rmse_e_pa is not None:
+                                wandb_log_flat[f"{valid_loader_name}/valid_rmse_e_per_atom"] = rmse_e_pa
+                            
+                            if mae_e_pa is not None:                                      
+                                wandb_log_flat[f"{valid_loader_name}/valid_mae_e_per_atom"] = mae_e_pa
+                            
+                            if mae_e is not None:
+                                wandb_log_flat[f"{valid_loader_name}/valid_mae_e"] = mae_e
+
+                            # only log forces if present 
+                            if rmse_f is not None:
+                                wandb_log_flat[f"{valid_loader_name}/valid_rmse_f"] = rmse_f
+
+
                 if plotter and epoch % plotter.plot_frequency == 0:
                     try:
                         plotter.plot(epoch, model_to_evaluate, rank)
@@ -346,8 +374,8 @@ def train(
                 valid_loss = (
                     valid_loss_head  # consider only the last head for the checkpoint
                 )
-            if log_wandb:
-                wandb.log(wandb_log_dict)
+            if log_wandb and rank == 0:
+                wandb.log(wandb_log_flat)
             if rank == 0:
                 if valid_loss >= lowest_loss:
                     patience_counter += 1

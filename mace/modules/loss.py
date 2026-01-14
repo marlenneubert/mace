@@ -259,8 +259,21 @@ class WeightedEnergyForcesLoss(torch.nn.Module):
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         loss_energy = weighted_mean_squared_error_energy(ref, pred, ddp)
-        loss_forces = mean_squared_error_forces(ref, pred, ddp)
-        return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+        loss = self.energy_weight * loss_energy
+
+        # only compute forces loss if forces are present 
+        if float(self.forces_weight) > 0.0:
+            if pred.get("forces") is None:
+                raise ValueError(
+                    "forces_weight > 0 but pred['forces'] is None. "
+                    "Set compute_forces: true or set forces_weight: 0.0."
+                )
+            loss_forces = mean_squared_error_forces(ref, pred, ddp)
+            loss = loss + self.forces_weight * loss_forces
+        # before:
+        #loss_forces = mean_squared_error_forces(ref, pred, ddp)
+        #return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+        return loss
 
     def __repr__(self):
         return (
