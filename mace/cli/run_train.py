@@ -702,6 +702,12 @@ def run(args) -> None:
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    if not args.compute_forces:
+        assert output_args.get("forces", False) is False, (
+            f"compute_forces is False, but output_args['forces']={output_args.get('forces')}. "
+            "Check configure_model / config propagation."
+        )
+
     model.to(device)
 
     logging.debug(model)
@@ -812,7 +818,7 @@ def run(args) -> None:
             if opt_start_epoch is not None:
                 start_epoch = opt_start_epoch
 
-    if args.wandb:
+    if args.wandb and rank == 0:
         setup_wandb(args)
     if args.distributed:
         distributed_model = DDP(model, device_ids=[local_rank])
