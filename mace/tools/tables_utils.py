@@ -1,11 +1,25 @@
 import logging
 from typing import Dict, List, Optional
-
+from numbers import Number
 import torch
 from prettytable import PrettyTable
 
 from mace.tools import evaluate
 
+def _wandb_scalar(x):
+    # handles None, tensors, and the NoneMultiply placeholder
+    if x is None:
+        return None
+    if x.__class__.__name__ == "NoneMultiply":
+        return None
+    if isinstance(x, Number):
+        return float(x)
+    if torch.is_tensor(x):
+        return x.detach().cpu().item()
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 def custom_key(key):
     """
@@ -134,7 +148,19 @@ def create_error_table(
                 name + "_final_rmse_f": metrics["rmse_f"] * 1e3,  # meV / A
                 name + "_final_rel_rmse_f": metrics["rel_rmse_f"],
             }
-            wandb.log(wandb_log_dict)
+            sanitized = {}
+            for k, v in wandb_log_dict.items():
+                # keep wandb.Table objects as-is
+                if v.__class__.__name__ == "Table":
+                    sanitized[k] = v
+                    continue
+                sv = _wandb_scalar(v)
+                if sv is not None:
+                    sanitized[k] = sv
+
+            wandb.log(sanitized)
+            
+            #wandb.log(wandb_log_dict)
         if table_type == "TotalRMSE":
             table.add_row(
                 [
