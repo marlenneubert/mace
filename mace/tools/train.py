@@ -223,6 +223,20 @@ def valid_err_log(
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if hasattr(model, "module") else model
 
+def _param_l2_norm_by_name_substrings(
+    model: torch.nn.Module,
+    substrings=("method", "embed"),
+) -> Optional[float]:
+    base = _unwrap_model(model)
+    tot = 0.0
+    found = False
+    for name, p in base.named_parameters():
+        if any(s in name for s in substrings):
+            found = True
+            tot += p.detach().float().pow(2).sum().item()
+    if not found:
+        return None
+    return float(np.sqrt(tot))
 
 def _method_pca_reg_term(model: torch.nn.Module) -> Optional[torch.Tensor]:
     """
@@ -309,6 +323,8 @@ def train(
     logging.info("Started training, reporting errors on validation set")
     logging.info("Loss metrics on validation set")
     epoch = start_epoch
+    #### modify: eval metrics logging interval to 10 epochs
+    train_metrics_interval = 5
 
     # log validation loss before _any_ training
     for valid_loader_name, valid_loader in valid_loaders.items():
@@ -386,6 +402,53 @@ def train(
                 optimizer.eval()
             with param_context:
                 wandb_log_flat = {"epoch": epoch}
+
+                # add: log LR
+                if log_wandb and rank == 0:
+                    # robust to multiple param groups (log mean; also min/max if >1 group)
+                    lrs = [pg.get("lr", None) for pg in optimizer.param_groups]
+                    lrs = [lr for lr in lrs if lr is not None]
+                    if lrs:
+                        wandb_log_flat["lr"] = float(sum(lrs) / len(lrs))
+                        if len(lrs) > 1:
+                            wandb_log_flat["lr_min"] = float(min(lrs))
+                            wandb_log_flat["lr_max"] = float(max(lrs))
+                
+                # add: wandb log train metrics, every train_metrics_interval epochs
+                if (epoch % train_metrics_interval) == 0:
+                    train_loss_head, train_metrics = evaluate(
+                        model=model_to_evaluate,
+                        loss_fn=loss_fn,
+                        data_loader=train_loader,
+                        output_args=output_args,
+                        device=device,
+                    )
+                    if log_wandb and rank == 0:
+                        wandb_log_flat["train/train_loss"] = float(train_loss_head)
+
+                        train_mae_e = _wandb_scalar(train_metrics.get("mae_e"))
+                        train_mae_e_pa = _wandb_scalar(train_metrics.get("mae_e_per_atom"))
+                        train_rmse_e_pa = _wandb_scalar(train_metrics.get("rmse_e_per_atom"))
+
+                        if train_mae_e is not None:
+                            wandb_log_flat["train/train_mae_e"] = train_mae_e
+                        if train_mae_e_pa is not None:
+                            wandb_log_flat["train/train_mae_e_per_atom"] = train_mae_e_pa
+                        if train_rmse_e_pa is not None:
+                            wandb_log_flat["train/train_rmse_e_per_atom"] = train_rmse_e_pa
+
+                        # wandb log regularization terms (method pca) and method param norms
+                        if log_wandb and rank == 0:
+                            reg = _method_pca_reg_term(model_to_evaluate)
+                            if reg is not None:
+                                reg_val = float(reg.detach().cpu())
+                                wandb_log_flat["reg/method_pca_mse"] = reg_val
+                                wandb_log_flat["reg/method_pca_weighted"] = float(method_pca_reg_weight) * reg_val
+
+                            method_param_l2 = _param_l2_norm_by_name_substrings(model_to_evaluate)
+                            if method_param_l2 is not None:
+                                wandb_log_flat["params/method_param_l2"] = method_param_l2
+
 
                 for valid_loader_name, valid_loader in valid_loaders.items():
                     valid_loss_head, eval_metrics = evaluate(
