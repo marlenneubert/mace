@@ -189,6 +189,7 @@ def configure_model(
             method_emb_dim=getattr(args, "method_emb_dim", 0),
             method_model=getattr(args, "method_model", "none"),
             method_injector=getattr(args, "method_injector", "resmlp"),
+            interaction_method=getattr(args, "interaction_method", "none"),
             method_pca_init=None,
         )
         model_config_foundation = None
@@ -203,6 +204,11 @@ def configure_model(
                 raise ValueError(f"method_pca_file dim {pca.shape[1]} != method_emb_dim {args.method_emb_dim}")
             model_config["method_pca_init"] = pca #torch.tensor(pca, dtype=torch.get_default_dtype())
 
+    model_config["interaction_method"] = getattr(
+        args,
+        "interaction_method",
+        model_config.get("interaction_method", "none"),
+    )
 
     model = _build_model(args, model_config, model_config_foundation, heads)
 

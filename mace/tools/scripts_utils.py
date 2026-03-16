@@ -322,6 +322,9 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         "atomic_inter_scale": scale.cpu().numpy(),
         "atomic_inter_shift": shift.cpu().numpy(),
         "heads": heads,
+        "interaction_method": (
+            model.interaction_method if hasattr(model, "interaction_method") else "none"
+        ),
     }
     if model.__class__.__name__ == "AtomicDielectricMACE":
         config["use_polarizability"] = model.use_polarizability
@@ -337,17 +340,18 @@ def extract_load(f: str, map_location: str = "cpu") -> torch.nn.Module:
 
 
 def extract_radial_MLP(model: torch.nn.Module) -> List[int]:
+    radial = model.interactions[0].conv_tp_weights
+
+    if hasattr(radial, "hidden_dims"):
+        return list(radial.hidden_dims)
+
     try:
-        return model.interactions[0].conv_tp_weights.hs[1:-1]
+        return radial.hs[1:-1]
     except AttributeError:
         try:
             return [
-                int(
-                    model.interactions[0]
-                    .conv_tp_weights.net[k]
-                    .__dict__["normalized_shape"][0]
-                )
-                for k in range(1, len(model.interactions[0].conv_tp_weights.net), 3)
+                int(radial.net[k].__dict__["normalized_shape"][0])
+                for k in range(1, len(radial.net), 3)
             ]
         except AttributeError:
             return []

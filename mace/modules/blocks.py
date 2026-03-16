@@ -452,6 +452,37 @@ class EquivariantProductBasisBlock(torch.nn.Module):
             return self.linear(node_feats) + sc
         return self.linear(node_feats)
 
+## add conditioned MLP module
+@compile_mode("script")
+class ConcatConditionedRadialMLP(torch.nn.Module):
+    def __init__(
+        self,
+        edge_input_dim: int,
+        method_dim: int,
+        hidden_dims: List[int],
+        out_dim: int,
+    ):
+        super().__init__()
+        self.edge_input_dim = edge_input_dim
+        self.method_dim = method_dim
+        self.hidden_dims = list(hidden_dims)
+
+        layers: List[torch.nn.Module] = []
+        in_dim = edge_input_dim + method_dim
+        for h_dim in hidden_dims:
+            layers.append(torch.nn.Linear(in_dim, h_dim))
+            layers.append(torch.nn.SiLU())
+            in_dim = h_dim
+        layers.append(torch.nn.Linear(in_dim, out_dim))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(
+        self,
+        edge_feats: torch.Tensor,
+        method_z: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([edge_feats, method_z.to(edge_feats.dtype)], dim=-1)
+        return self.net(x)
 
 @compile_mode("script")
 class InteractionBlock(torch.nn.Module):
@@ -466,6 +497,8 @@ class InteractionBlock(torch.nn.Module):
         avg_num_neighbors: float,
         edge_irreps: Optional[o3.Irreps] = None,
         radial_MLP: Optional[List[int]] = None,
+        interaction_method: str = "none",
+        method_emb_dim: int = 0,
         cueq_config: Optional[CuEquivarianceConfig] = None,
         oeq_config: Optional[OEQConfig] = None,
     ) -> None:
@@ -483,6 +516,8 @@ class InteractionBlock(torch.nn.Module):
             edge_irreps = self.node_feats_irreps
         self.radial_MLP = radial_MLP
         self.edge_irreps = edge_irreps
+        self.interaction_method = interaction_method
+        self.method_emb_dim = method_emb_dim
         self.cueq_config = cueq_config
         self.oeq_config = oeq_config
         if self.oeq_config and self.oeq_config.conv_fusion:
@@ -519,6 +554,57 @@ class InteractionBlock(torch.nn.Module):
     ) -> torch.Tensor:
         """Truncate the tensor to only keep the real atoms in case of presence of ghost atoms during multi-GPU MD simulations."""
         return tensor[:n_real] if n_real is not None else tensor
+
+    ## add helper methods for radial conditioning
+    def _make_conv_tp_weights(
+        self,
+        input_dim: int,
+        out_dim: int,
+    ) -> torch.nn.Module:
+        if self.interaction_method == "none":
+            return nn.FullyConnectedNet(
+                [input_dim] + self.radial_MLP + [out_dim],
+                torch.nn.functional.silu,
+            )
+
+        if self.interaction_method == "radial_concat":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_concat' requires method_emb_dim > 0"
+                )
+            return ConcatConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=self.radial_MLP,
+                out_dim=out_dim,
+            )
+
+        raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
+
+    def _compute_conv_tp_weights(
+        self,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.interaction_method == "none":
+            return self.conv_tp_weights(edge_feats)
+
+        if self.interaction_method == "radial_concat":
+            if method_z is None:
+                raise ValueError(
+                    "interaction_method='radial_concat' requires method_z in forward()"
+                )
+            if node_batch is None:
+                raise ValueError(
+                    "interaction_method='radial_concat' requires node_batch in forward()"
+                )
+            edge_batch = node_batch[edge_index[0]]
+            z_edge = method_z[edge_batch]
+            return self.conv_tp_weights(edge_feats, z_edge)
+
+        raise ValueError(f"Unknown interaction_method: {self.interaction_method}")    
 
     @abstractmethod
     def forward(
@@ -569,11 +655,18 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         )
 
         # Convolution weights
+        # original
+        #input_dim = self.edge_feats_irreps.num_irreps
+        #self.conv_tp_weights = nn.FullyConnectedNet(
+        #    [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
+        #    torch.nn.functional.silu,
+        #)
+        # new with radial MLP conditioning
         input_dim = self.edge_feats_irreps.num_irreps
-        self.conv_tp_weights = nn.FullyConnectedNet(
-            [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
-            torch.nn.functional.silu,
-        )
+        self.conv_tp_weights = self._make_conv_tp_weights(
+            input_dim=input_dim,
+            out_dim=self.conv_tp.weight_numel,
+        )        
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -602,6 +695,8 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         lammps_class: Optional[Any] = None,
         first_layer: bool = False,
@@ -614,7 +709,16 @@ class RealAgnosticInteractionBlock(InteractionBlock):
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
+        # before
+        #tp_weights = self.conv_tp_weights(edge_feats)
+        # with radial MLP conditioning
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
+
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
 
@@ -673,10 +777,15 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
 
         # Convolution weights
         input_dim = self.edge_feats_irreps.num_irreps
-        self.conv_tp_weights = nn.FullyConnectedNet(
-            [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
-            torch.nn.functional.silu,  # gate
-        )
+        #self.conv_tp_weights = nn.FullyConnectedNet(
+        #    [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
+        #    torch.nn.functional.silu,  # gate
+        #)
+        # with radial MLP conditioning
+        self.conv_tp_weights = self._make_conv_tp_weights(
+                    input_dim=input_dim,
+                    out_dim=self.conv_tp.weight_numel,
+                )        
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -705,6 +814,8 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
@@ -718,7 +829,14 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
+        #tp_weights = self.conv_tp_weights(edge_feats)
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
+
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
         message = None
@@ -776,9 +894,14 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
 
         # Convolution weights
         input_dim = self.edge_feats_irreps.num_irreps
-        self.conv_tp_weights = nn.FullyConnectedNet(
-            [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
-            torch.nn.functional.silu,
+        #self.conv_tp_weights = nn.FullyConnectedNet(
+        #    [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
+        #    torch.nn.functional.silu,
+        #)
+        # with radial MLP conditioning
+        self.conv_tp_weights = self._make_conv_tp_weights(
+            input_dim=input_dim,
+            out_dim=self.conv_tp.weight_numel,
         )
 
         # Linear
@@ -818,6 +941,8 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
@@ -832,7 +957,14 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
+        #tp_weights = self.conv_tp_weights(edge_feats)
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
+        
         edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
@@ -897,9 +1029,14 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
 
         # Convolution weights
         input_dim = self.edge_feats_irreps.num_irreps
-        self.conv_tp_weights = nn.FullyConnectedNet(
-            [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
-            torch.nn.functional.silu,  # gate
+        #self.conv_tp_weights = nn.FullyConnectedNet(
+        #    [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
+        #    torch.nn.functional.silu,  # gate
+        #)
+        # with radial MLP conditioning
+        self.conv_tp_weights = self._make_conv_tp_weights(
+            input_dim=input_dim,
+            out_dim=self.conv_tp.weight_numel,
         )
 
         # Linear
@@ -940,6 +1077,8 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
@@ -955,7 +1094,13 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
+        #tp_weights = self.conv_tp_weights(edge_feats)
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
         edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff

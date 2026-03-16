@@ -84,6 +84,7 @@ class MACE(torch.nn.Module):
         method_model: str = "none",
         method_pca_init: Optional[np.ndarray] = None,
         method_injector: str = "resmlp",
+        interaction_method: str = "none",
     ):
         super().__init__()
         self.register_buffer(
@@ -114,6 +115,7 @@ class MACE(torch.nn.Module):
         self.method_emb_dim = method_emb_dim
         self.method_pca_init = method_pca_init
         self.method_injector = method_injector
+        self.interaction_method = interaction_method
         self.method_gamma = None
         self.method_beta = None
 
@@ -326,6 +328,8 @@ class MACE(torch.nn.Module):
             edge_irreps=edge_irreps_first,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
+            interaction_method=self.interaction_method,
+            method_emb_dim=self.method_emb_dim,
             cueq_config=cueq_config,
             oeq_config=oeq_config,
         )
@@ -378,6 +382,8 @@ class MACE(torch.nn.Module):
                 avg_num_neighbors=avg_num_neighbors,
                 edge_irreps=edge_irreps,
                 radial_MLP=radial_MLP,
+                interaction_method=self.interaction_method,
+                method_emb_dim=self.method_emb_dim,
                 cueq_config=cueq_config,
                 oeq_config=oeq_config,
             )
@@ -415,6 +421,31 @@ class MACE(torch.nn.Module):
                         oeq_config,
                     )
                 )
+    # helpers for radial MLP conditioning
+    def _get_method_idx_graph(
+        self,
+        data: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if "method_index" not in data:
+            return None
+        method_idx_graph = data["method_index"].to(torch.long)
+        if method_idx_graph.dim() > 1:
+            method_idx_graph = method_idx_graph.squeeze(-1)
+        return method_idx_graph
+
+    def _get_method_z_graph(
+        self,
+        method_idx_graph: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if method_idx_graph is None:
+            return None
+        if self.method_model == "m_emb":
+            return self.method_embedding(method_idx_graph)
+        if self.method_model == "m_pcafix":
+            return self.method_pca_table[method_idx_graph]
+        if self.method_model == "m_pcainit":
+            return self.method_pca[method_idx_graph]
+        return None
 
     def forward(
         self,
@@ -462,46 +493,55 @@ class MACE(torch.nn.Module):
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
 
-        if "method_index" in data and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit"):
-            # method_index is graph-level: [n_graphs] or [n_graphs, 1]
-            method_idx_graph = data["method_index"].to(torch.long)
-            if method_idx_graph.dim() > 1:
-                method_idx_graph = method_idx_graph.squeeze(-1)
-
-            batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
-
+        batch = data["batch"]
+        method_idx_graph = self._get_method_idx_graph(data)
+        z_graph = self._get_method_z_graph(method_idx_graph)
+        # method conditioning input and internal in radial MLP
+        if method_idx_graph is not None and self.method_model in (
+            "m_bias",
+            "m_emb",
+            "m_pcafix",
+            "m_pcainit",
+        ):
             if self.method_model == "m_bias":
-                # e_m per method -> per graph -> per node
-                e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
-                e_nodes = e_graph[batch]                          # [n_nodes, C0]
+                e_graph = self.method_bias[method_idx_graph]   # [n_graphs, C0]
+                e_nodes = e_graph[batch]                       # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
-
             else:
-                # get method vector z_m per graph
-                if self.method_model == "m_emb":
-                    z_graph = self.method_embedding(method_idx_graph)      # [n_graphs, D_m]
-                elif self.method_model == "m_pcafix":
-                    z_graph = self.method_pca_table[method_idx_graph]      # [n_graphs, D_m]
-                else:  # "m_pcainit"
-                    z_graph = self.method_pca[method_idx_graph]            # [n_graphs, D_m]
+                if z_graph is None:
+                    raise ValueError(
+                        f"Could not construct method vector for method_model='{self.method_model}'"
+                    )
 
                 if self.method_injector == "resmlp":
-                    # broadcast to nodes
                     z_nodes = z_graph[batch]  # [n_nodes, D_m]
-                    x = torch.cat([node_feats, z_nodes.to(node_feats.dtype)], dim=-1)  # [n_nodes, C0 + D_m]
-                    delta = self.method_mlp(x)  # [n_nodes, C0]
+                    x = torch.cat(
+                        [node_feats, z_nodes.to(node_feats.dtype)],
+                        dim=-1,
+                    )
+                    delta = self.method_mlp(x)
                     node_feats = node_feats + delta
 
                 elif self.method_injector == "film":
-                    # strict FiLM: s <- (1 + g(z)) * s + b(z)
-                    gamma_graph = 1.0 + self.method_gamma(z_graph)         # [n_graphs, C0]
-                    beta_graph  = self.method_beta(z_graph)                # [n_graphs, C0]
-                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)   # [n_nodes, C0]
-                    beta_nodes  = beta_graph[batch].to(node_feats.dtype)    # [n_nodes, C0]
+                    gamma_graph = 1.0 + self.method_gamma(z_graph)
+                    beta_graph = self.method_beta(z_graph)
+                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)
+                    beta_nodes = beta_graph[batch].to(node_feats.dtype)
                     node_feats = gamma_nodes * node_feats + beta_nodes
 
                 else:
                     raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
+        if self.interaction_method != "none":
+            if method_idx_graph is None:
+                raise ValueError(
+                    "interaction_method != 'none' requires 'method_index' in the batch."
+                )
+            if z_graph is None:
+                raise ValueError(
+                    "interaction_method != 'none' currently requires "
+                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                )
 
 
 
@@ -562,6 +602,8 @@ class MACE(torch.nn.Module):
                 edge_feats=edge_feats,
                 edge_index=data["edge_index"],
                 cutoff=cutoff,
+                method_z=z_graph if self.interaction_method != "none" else None,
+                node_batch=batch if self.interaction_method != "none" else None,
                 first_layer=(i == 0),
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,
@@ -687,49 +729,58 @@ class ScaleShiftMACE(MACE):
         )  # [n_graphs, num_heads]
 
         # Embeddings
+        # input conditioning and internal radial MLP conditioning
         node_feats = self.node_embedding(data["node_attrs"])
 
+        batch = data["batch"]
+        method_idx_graph = self._get_method_idx_graph(data)
+        z_graph = self._get_method_z_graph(method_idx_graph)
 
-        if "method_index" in data and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit"):
-            # method_index is graph-level: [n_graphs] or [n_graphs, 1]
-            method_idx_graph = data["method_index"].to(torch.long)
-            if method_idx_graph.dim() > 1:
-                method_idx_graph = method_idx_graph.squeeze(-1)
-
-            batch = data["batch"]  # [n_nodes], values 0..n_graphs-1
-
+        if method_idx_graph is not None and self.method_model in (
+            "m_bias",
+            "m_emb",
+            "m_pcafix",
+            "m_pcainit",
+        ):
             if self.method_model == "m_bias":
-                # e_m per method -> per graph -> per node
-                e_graph = self.method_bias[method_idx_graph]      # [n_graphs, C0]
-                e_nodes = e_graph[batch]                          # [n_nodes, C0]
+                e_graph = self.method_bias[method_idx_graph]   # [n_graphs, C0]
+                e_nodes = e_graph[batch]                       # [n_nodes, C0]
                 node_feats = node_feats + e_nodes
-
             else:
-                # get method vector z_m per graph
-                if self.method_model == "m_emb":
-                    z_graph = self.method_embedding(method_idx_graph)      # [n_graphs, D_m]
-                elif self.method_model == "m_pcafix":
-                    z_graph = self.method_pca_table[method_idx_graph]      # [n_graphs, D_m]
-                else:  # "m_pcainit"
-                    z_graph = self.method_pca[method_idx_graph]            # [n_graphs, D_m]
+                if z_graph is None:
+                    raise ValueError(
+                        f"Could not construct method vector for method_model='{self.method_model}'"
+                    )
 
                 if self.method_injector == "resmlp":
-                    # broadcast to nodes
                     z_nodes = z_graph[batch]  # [n_nodes, D_m]
-                    x = torch.cat([node_feats, z_nodes.to(node_feats.dtype)], dim=-1)  # [n_nodes, C0 + D_m]
-                    delta = self.method_mlp(x)  # [n_nodes, C0]
+                    x = torch.cat(
+                        [node_feats, z_nodes.to(node_feats.dtype)],
+                        dim=-1,
+                    )
+                    delta = self.method_mlp(x)
                     node_feats = node_feats + delta
 
                 elif self.method_injector == "film":
-                    # strict FiLM: s <- (1 + g(z)) * s + b(z)
-                    gamma_graph = 1.0 + self.method_gamma(z_graph)         # [n_graphs, C0]
-                    beta_graph  = self.method_beta(z_graph)                # [n_graphs, C0]
-                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)   # [n_nodes, C0]
-                    beta_nodes  = beta_graph[batch].to(node_feats.dtype)    # [n_nodes, C0]
+                    gamma_graph = 1.0 + self.method_gamma(z_graph)
+                    beta_graph = self.method_beta(z_graph)
+                    gamma_nodes = gamma_graph[batch].to(node_feats.dtype)
+                    beta_nodes = beta_graph[batch].to(node_feats.dtype)
                     node_feats = gamma_nodes * node_feats + beta_nodes
 
                 else:
                     raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
+        if self.interaction_method != "none":
+            if method_idx_graph is None:
+                raise ValueError(
+                    "interaction_method != 'none' requires 'method_index' in the batch."
+                )
+            if z_graph is None:
+                raise ValueError(
+                    "interaction_method != 'none' currently requires "
+                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                )
 
 
 
@@ -787,6 +838,8 @@ class ScaleShiftMACE(MACE):
                 edge_feats=edge_feats,
                 edge_index=data["edge_index"],
                 cutoff=cutoff,
+                method_z=z_graph if self.interaction_method != "none" else None,
+                node_batch=batch if self.interaction_method != "none" else None,
                 first_layer=(i == 0),
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,

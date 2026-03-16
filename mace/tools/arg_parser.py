@@ -383,6 +383,20 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "'film' = strict FiLM: s <- (1+g(z))*s + b(z) with identity init."
         ),
     )
+    # internal conditioning
+    parser.add_argument(
+        "--interaction_method",
+        type=str,
+        default="none",
+        choices=["none", "radial_concat"],
+        help=(
+            "Optional method conditioning inside interaction blocks. "
+            "'none' = standard MACE interaction; "
+            "'radial_concat' = concatenate graph-level method vector z_m "
+            "to edge radial features before the radial MLP."
+        ),
+    )
+
     # pcainit regularizer
     parser.add_argument("--method_pca_reg_weight", type=float, default=0.0)
     parser.add_argument("--method_pca_freeze_epochs", type=int, default=0)
