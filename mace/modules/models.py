@@ -113,12 +113,25 @@ class MACE(torch.nn.Module):
         self.method_model = method_model  # "none", "m_bias", "m_emb", ...
         self.num_methods = num_methods
         self.method_emb_dim = method_emb_dim
-        self.method_pca_init = method_pca_init
+        #self.method_pca_init = method_pca_init
         self.method_injector = method_injector
         self.interaction_method = interaction_method
         self.method_gamma = None
         self.method_beta = None
 
+        # check
+        if self.interaction_method not in ("none", "radial_concat"):
+            raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
+
+        if self.interaction_method != "none" and self.method_model not in (
+            "m_emb",
+            "m_pcafix",
+            "m_pcainit",
+        ):
+            raise ValueError(
+                "interaction_method != 'none' currently requires "
+                "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}"
+            )
 
 
         # Embedding

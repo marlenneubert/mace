@@ -614,6 +614,12 @@ class InteractionBlock(torch.nn.Module):
         edge_attrs: torch.Tensor,
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
+        cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
+        lammps_class: Optional[Any] = None,
+        lammps_natoms: Tuple[int, int] = (0, 0),
+        first_layer: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -1166,6 +1172,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
         )
 
         # Convolution weights
+        # conditioned radial MLP with node feature concatenation
         self.linear_down = Linear(
             self.node_feats_irreps,
             self.node_feats_down_irreps,
@@ -1177,10 +1184,25 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
             self.edge_feats_irreps.num_irreps
             + 2 * self.node_feats_down_irreps.num_irreps
         )
-        self.conv_tp_weights = nn.FullyConnectedNet(
-            [input_dim] + 3 * [256] + [self.conv_tp.weight_numel],
-            torch.nn.functional.silu,
-        )
+
+        if self.interaction_method == "none":
+            self.conv_tp_weights = nn.FullyConnectedNet(
+                [input_dim] + 3 * [256] + [self.conv_tp.weight_numel],
+                torch.nn.functional.silu,
+            )
+        elif self.interaction_method == "radial_concat":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_concat' requires method_emb_dim > 0"
+                )
+            self.conv_tp_weights = ConcatConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=[256, 256, 256],
+                out_dim=self.conv_tp.weight_numel,
+            )
+        else:
+            raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -1208,6 +1230,8 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
@@ -1225,7 +1249,15 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
             ],
             dim=-1,
         )
-        tp_weights = self.conv_tp_weights(augmented_edge_feats)
+        #tp_weights = self.conv_tp_weights(augmented_edge_feats)
+        # with radial MLP conditioning
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=augmented_edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
+
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
         message = None
@@ -1295,13 +1327,37 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         )
 
         # Convolution weights
-        input_dim = self.edge_feats_irreps.num_irreps
-        self.conv_tp_weights = RadialMLP(
-            [input_dim + 2 * node_scalar_irreps.dim]
-            + self.radial_MLP
-            + [self.conv_tp.weight_numel]
-        )
+        #input_dim = self.edge_feats_irreps.num_irreps
+        #self.conv_tp_weights = RadialMLP(
+        #    [input_dim + 2 * node_scalar_irreps.dim]
+        #    + self.radial_MLP
+        #    + [self.conv_tp.weight_numel]
+        #)
+        #self.irreps_out = self.target_irreps
+        # Convolution weights
+        # with radial MLP conditioning on edge features and node scalar embeddings
+        input_dim = self.edge_feats_irreps.num_irreps + 2 * node_scalar_irreps.dim
+
+        if self.interaction_method == "none":
+            self.conv_tp_weights = RadialMLP(
+                [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel]
+            )
+        elif self.interaction_method == "radial_concat":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_concat' requires method_emb_dim > 0"
+                )
+            self.conv_tp_weights = ConcatConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=self.radial_MLP,
+                out_dim=self.conv_tp.weight_numel,
+            )
+        else:
+            raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
+
         self.irreps_out = self.target_irreps
+
 
         # Selector TensorProduct
         self.skip_tp = Linear(
@@ -1381,6 +1437,8 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         cutoff: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
@@ -1399,7 +1457,20 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
 
         source_embedding = self.source_embedding(node_attrs)
         target_embedding = self.target_embedding(node_attrs)
-        edge_feats = torch.cat(
+        # before
+        #edge_feats = torch.cat(
+        #    [
+        #        edge_feats,
+        #        source_embedding[edge_index[0]],
+        #        target_embedding[edge_index[1]],
+        #    ],
+        #    dim=-1,
+        #)
+        #tp_weights = self.conv_tp_weights(edge_feats)
+
+        #edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
+        # with radial MLP conditioning on edge features and node scalar embeddings
+        aug_edge_feats = torch.cat(
             [
                 edge_feats,
                 source_embedding[edge_index[0]],
@@ -1407,9 +1478,17 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
             ],
             dim=-1,
         )
-        tp_weights = self.conv_tp_weights(edge_feats)
 
-        edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
+        tp_weights = self._compute_conv_tp_weights(
+            edge_feats=aug_edge_feats,
+            edge_index=edge_index,
+            method_z=method_z,
+            node_batch=node_batch,
+        )
+
+        edge_density = torch.tanh(self.density_fn(aug_edge_feats) ** 2)
+        
+        
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
             edge_density = edge_density * cutoff
