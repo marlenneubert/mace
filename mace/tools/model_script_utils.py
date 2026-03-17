@@ -191,6 +191,9 @@ def configure_model(
             method_injector=getattr(args, "method_injector", "resmlp"),
             interaction_method=getattr(args, "interaction_method", "none"),
             method_pca_init=None,
+            readout_method=getattr(args, "readout_method", "none"),
+            num_readout_basis_heads=getattr(args, "num_readout_basis_heads", 4),
+            readout_mixer_hidden_dim=getattr(args, "readout_mixer_hidden_dim", 0),
         )
         model_config_foundation = None
 
@@ -204,10 +207,28 @@ def configure_model(
                 raise ValueError(f"method_pca_file dim {pca.shape[1]} != method_emb_dim {args.method_emb_dim}")
             model_config["method_pca_init"] = pca #torch.tensor(pca, dtype=torch.get_default_dtype())
 
+    # internal and output conditioning arguments
     model_config["interaction_method"] = getattr(
         args,
         "interaction_method",
         model_config.get("interaction_method", "none"),
+    )
+    model_config["readout_method"] = getattr(
+        args,
+        "readout_method",
+        model_config.get("readout_method", "none"),
+    )
+
+    model_config["num_readout_basis_heads"] = getattr(
+        args,
+        "num_readout_basis_heads",
+        model_config.get("num_readout_basis_heads", 4),
+    )
+
+    model_config["readout_mixer_hidden_dim"] = getattr(
+        args,
+        "readout_mixer_hidden_dim",
+        model_config.get("readout_mixer_hidden_dim", 0),
     )
 
     model = _build_model(args, model_config, model_config_foundation, heads)

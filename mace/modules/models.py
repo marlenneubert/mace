@@ -29,6 +29,7 @@ from .blocks import (
     NonLinearReadoutBlock,
     RadialEmbeddingBlock,
     ScaleShiftBlock,
+    ContinuousBasisReadoutBlock,
 )
 from .utils import (
     compute_dielectric_gradients,
@@ -85,6 +86,9 @@ class MACE(torch.nn.Module):
         method_pca_init: Optional[np.ndarray] = None,
         method_injector: str = "resmlp",
         interaction_method: str = "none",
+        readout_method: str = "none",
+        num_readout_basis_heads: int = 4,
+        readout_mixer_hidden_dim: int = 0,        
     ):
         super().__init__()
         self.register_buffer(
@@ -118,6 +122,10 @@ class MACE(torch.nn.Module):
         self.interaction_method = interaction_method
         self.method_gamma = None
         self.method_beta = None
+        # ouput conditioning
+        self.readout_method = readout_method
+        self.num_readout_basis_heads = num_readout_basis_heads
+        self.readout_mixer_hidden_dim = readout_mixer_hidden_dim
 
         # check
         if self.interaction_method not in ("none", "radial_concat", "radial_film"):
@@ -131,6 +139,25 @@ class MACE(torch.nn.Module):
             raise ValueError(
                 "interaction_method != 'none' currently requires "
                 "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}"
+            )
+
+        if self.readout_method not in ("none", "basis_mix"):
+            raise ValueError(f"Unknown readout_method: {self.readout_method}")
+
+        if self.readout_method != "none" and self.method_model not in (
+            "m_emb",
+            "m_pcafix",
+            "m_pcainit",
+        ):
+            raise ValueError(
+                "readout_method != 'none' currently requires "
+                "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}"
+            )
+
+        if self.readout_method != "none" and len(heads) != 1:
+            raise ValueError(
+                "The first continuous readout implementation assumes len(heads) == 1. "
+                "Use heads=None / a single Default head."
             )
 
 
@@ -414,17 +441,31 @@ class MACE(torch.nn.Module):
             )
             self.products.append(prod)
             if i == num_interactions - 2:
-                self.readouts.append(
-                    readout_cls(
-                        hidden_irreps_out,
-                        (len(heads) * MLP_irreps).simplify(),
-                        gate,
-                        o3.Irreps(f"{len(heads)}x0e"),
-                        len(heads),
-                        cueq_config,
-                        oeq_config,
+                if self.readout_method == "basis_mix":
+                    self.readouts.append(
+                        ContinuousBasisReadoutBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            num_basis_heads=self.num_readout_basis_heads,
+                            mixer_hidden_dim=self.readout_mixer_hidden_dim,
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
                     )
-                )
+                else:
+                    self.readouts.append(
+                        readout_cls(
+                            hidden_irreps_out,
+                            (len(heads) * MLP_irreps).simplify(),
+                            gate,
+                            o3.Irreps(f"{len(heads)}x0e"),
+                            len(heads),
+                            cueq_config,
+                            oeq_config,
+                        )
+                    )
             elif not use_last_readout_only:
                 self.readouts.append(
                     LinearReadoutBlock(
@@ -551,6 +592,7 @@ class MACE(torch.nn.Module):
                 else:
                     raise ValueError(f"Unknown method_injector: {self.method_injector}")
 
+        # checks for interaction/readout method requirements
         if self.interaction_method != "none":
             if method_idx_graph is None:
                 raise ValueError(
@@ -561,7 +603,16 @@ class MACE(torch.nn.Module):
                     "interaction_method != 'none' currently requires "
                     "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
                 )
-
+        if self.readout_method != "none":
+            if method_idx_graph is None:
+                raise ValueError(
+                    "readout_method != 'none' requires 'method_index' in the batch."
+                )
+            if z_graph is None:
+                raise ValueError(
+                    "readout_method != 'none' currently requires "
+                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                )
 
 
 
@@ -636,9 +687,25 @@ class MACE(torch.nn.Module):
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es = readout(node_feats_concat[feat_idx], node_heads)[
-                num_atoms_arange, node_heads
-            ]
+            is_last_readout = i == (len(self.readouts) - 1)
+
+            if self.readout_method == "basis_mix" and is_last_readout:
+                node_out = readout(
+                    node_feats_concat[feat_idx],
+                    method_z=z_graph,
+                    node_batch=batch,
+                )  
+            else:
+                node_out = readout(
+                    node_feats_concat[feat_idx],
+                    node_heads,
+                )
+
+            if node_out.shape[-1] == 1:
+                node_es = node_out.squeeze(-1)
+            else:
+                node_es = node_out[num_atoms_arange, node_heads]
+
             energy = scatter_sum(node_es, data["batch"], dim=0, dim_size=num_graphs)
             energies.append(energy)
             node_energies_list.append(node_es)
@@ -795,7 +862,7 @@ class ScaleShiftMACE(MACE):
 
                 else:
                     raise ValueError(f"Unknown method_injector: {self.method_injector}")
-
+        # checks for interaction and readout method requirements
         if self.interaction_method != "none":
             if method_idx_graph is None:
                 raise ValueError(
@@ -806,7 +873,16 @@ class ScaleShiftMACE(MACE):
                     "interaction_method != 'none' currently requires "
                     "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
                 )
-
+        if self.readout_method != "none":
+            if method_idx_graph is None:
+                raise ValueError(
+                    "readout_method != 'none' requires 'method_index' in the batch."
+                )
+            if z_graph is None:
+                raise ValueError(
+                    "readout_method != 'none' currently requires "
+                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                )        
 
 
         edge_attrs = self.spherical_harmonics(vectors)
@@ -878,11 +954,26 @@ class ScaleShiftMACE(MACE):
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es_list.append(
-                readout(node_feats_list[feat_idx], node_heads)[
-                    num_atoms_arange, node_heads
-                ]
-            )
+            is_last_readout = i == (len(self.readouts) - 1)
+
+            if self.readout_method == "basis_mix" and is_last_readout:
+                node_out = readout(
+                    node_feats_list[feat_idx],
+                    method_z=z_graph,
+                    node_batch=batch,
+                )  # [n_nodes, 1]
+            else:
+                node_out = readout(
+                    node_feats_list[feat_idx],
+                    node_heads,
+                )
+
+            if node_out.shape[-1] == 1:
+                node_es = node_out.squeeze(-1)
+            else:
+                node_es = node_out[num_atoms_arange, node_heads]
+
+            node_es_list.append(node_es)
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)

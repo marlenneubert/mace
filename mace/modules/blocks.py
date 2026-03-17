@@ -71,12 +71,22 @@ class LinearReadoutBlock(torch.nn.Module):
             irreps_in=irreps_in, irreps_out=irrep_out, cueq_config=cueq_config
         )
 
+    # before
+    # def forward(
+    #    self,
+    #    x: torch.Tensor,
+    #    heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+    #) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
+    #    return self.linear(x)  # [n_nodes, 1]
+    # for output conditioning also pass method and node batch
     def forward(
         self,
         x: torch.Tensor,
         heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
-    ) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
-        return self.linear(x)  # [n_nodes, 1]
+        method_z: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+        node_batch: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+    ) -> torch.Tensor:
+        return self.linear(x)
 
 
 @compile_mode("script")
@@ -104,15 +114,103 @@ class NonLinearReadoutBlock(torch.nn.Module):
             irreps_in=self.hidden_irreps, irreps_out=irrep_out, cueq_config=cueq_config
         )
 
+    # before
+    #def forward(
+    #    self, x: torch.Tensor, heads: Optional[torch.Tensor] = None
+    #) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
+    #    x = self.non_linearity(self.linear_1(x))
+    #    if hasattr(self, "num_heads"):
+    #        if self.num_heads > 1 and heads is not None:
+    #            x = mask_head(x, heads, self.num_heads)
+    #    return self.linear_2(x)  # [n_nodes, len(heads)]
+    # output conditioining
     def forward(
-        self, x: torch.Tensor, heads: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
+        self,
+        x: torch.Tensor,
+        heads: Optional[torch.Tensor] = None,
+        method_z: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+        node_batch: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+    ) -> torch.Tensor:
         x = self.non_linearity(self.linear_1(x))
         if hasattr(self, "num_heads"):
             if self.num_heads > 1 and heads is not None:
                 x = mask_head(x, heads, self.num_heads)
-        return self.linear_2(x)  # [n_nodes, len(heads)]
+        return self.linear_2(x)
 
+# continuous basis-mix readout block
+@compile_mode("script")
+class ContinuousBasisReadoutBlock(torch.nn.Module):
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        num_basis_heads: int = 4,
+        mixer_hidden_dim: int = 0,
+        cueq_config: Optional[CuEquivarianceConfig] = None,
+        oeq_config: Optional[OEQConfig] = None,  # pylint: disable=unused-argument
+    ):
+        super().__init__()
+        self.hidden_irreps = MLP_irreps
+        self.method_dim = method_dim
+        self.num_basis_heads = num_basis_heads
+        self.mixer_hidden_dim = mixer_hidden_dim
+
+        self.linear_1 = Linear(
+            irreps_in=irreps_in,
+            irreps_out=self.hidden_irreps,
+            cueq_config=cueq_config,
+        )
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )
+        self.linear_2 = Linear(
+            irreps_in=self.hidden_irreps,
+            irreps_out=o3.Irreps(f"{num_basis_heads}x0e"),
+            cueq_config=cueq_config,
+        )
+
+        if mixer_hidden_dim > 0:
+            self.mixer = torch.nn.Sequential(
+                torch.nn.Linear(method_dim, mixer_hidden_dim),
+                torch.nn.SiLU(),
+                torch.nn.Linear(mixer_hidden_dim, num_basis_heads),
+            )
+            # initialize final layer to uniform logits at start
+            torch.nn.init.zeros_(self.mixer[-1].weight)
+            torch.nn.init.zeros_(self.mixer[-1].bias)
+        else:
+            self.mixer = torch.nn.Linear(method_dim, num_basis_heads)
+            torch.nn.init.zeros_(self.mixer.weight)
+            torch.nn.init.zeros_(self.mixer.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        heads: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
+        method_z: Optional[torch.Tensor] = None,
+        node_batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError(
+                "ContinuousBasisReadoutBlock requires method_z in forward()."
+            )
+        if node_batch is None:
+            raise ValueError(
+                "ContinuousBasisReadoutBlock requires node_batch in forward()."
+            )
+
+        x = self.non_linearity(self.linear_1(x))
+        basis_es = self.linear_2(x)  # [n_nodes, K]
+
+        mix_logits = self.mixer(method_z.to(basis_es.dtype))  # [n_graphs, K]
+        mix_weights = torch.softmax(mix_logits, dim=-1)
+        mix_weights_nodes = mix_weights[node_batch]  # [n_nodes, K]
+
+        node_e = torch.sum(basis_es * mix_weights_nodes, dim=-1, keepdim=True)
+        return node_e  # [n_nodes, 1]
 
 @simplify_if_compile
 @compile_mode("script")

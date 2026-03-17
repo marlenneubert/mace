@@ -398,6 +398,34 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "using the graph-level method vector z_m."
         ),
     )
+    # output conditioning
+    parser.add_argument(
+        "--readout_method",
+        type=str,
+        default="none",
+        choices=["none", "basis_mix"],
+        help=(
+            "Optional method conditioning in the final scalar readout. "
+            "'none' = standard readout; "
+            "'basis_mix' = continuous mixture of K basis readout heads "
+            "using the graph-level method vector z_m."
+        ),
+    )
+    parser.add_argument(
+        "--num_readout_basis_heads",
+        type=int,
+        default=4,
+        help="Number of basis heads for readout_method='basis_mix'.",
+    )
+    parser.add_argument(
+        "--readout_mixer_hidden_dim",
+        type=int,
+        default=0,
+        help=(
+            "Hidden dimension of the method-to-mixture MLP for "
+            "readout_method='basis_mix'. Use 0 for a single linear layer."
+        ),
+    )    
 
     # pcainit regularizer
     parser.add_argument("--method_pca_reg_weight", type=float, default=0.0)
