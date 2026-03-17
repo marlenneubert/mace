@@ -388,12 +388,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--interaction_method",
         type=str,
         default="none",
-        choices=["none", "radial_concat"],
+        choices=["none", "radial_concat", "radial_film"],
         help=(
             "Optional method conditioning inside interaction blocks. "
             "'none' = standard MACE interaction; "
             "'radial_concat' = concatenate graph-level method vector z_m "
-            "to edge radial features before the radial MLP."
+            "to edge radial features before the radial MLP; "
+            "'radial_film' = FiLM-modulate the hidden layers of the radial MLP "
+            "using the graph-level method vector z_m."
         ),
     )
 

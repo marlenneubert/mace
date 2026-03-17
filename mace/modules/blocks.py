@@ -484,6 +484,62 @@ class ConcatConditionedRadialMLP(torch.nn.Module):
         x = torch.cat([edge_feats, method_z.to(edge_feats.dtype)], dim=-1)
         return self.net(x)
 
+# new film radial conditioning
+@compile_mode("script")
+class FiLMConditionedRadialMLP(torch.nn.Module):
+    def __init__(
+        self,
+        edge_input_dim: int,
+        method_dim: int,
+        hidden_dims: List[int],
+        out_dim: int,
+    ):
+        super().__init__()
+        self.edge_input_dim = edge_input_dim
+        self.method_dim = method_dim
+        self.hidden_dims = list(hidden_dims)
+        self.out_dim = out_dim
+
+        self.hidden_linears = torch.nn.ModuleList()
+        self.film_gamma = torch.nn.ModuleList()
+        self.film_beta = torch.nn.ModuleList()
+
+        in_dim = edge_input_dim
+        for h_dim in hidden_dims:
+            self.hidden_linears.append(torch.nn.Linear(in_dim, h_dim))
+            self.film_gamma.append(torch.nn.Linear(method_dim, h_dim))
+            self.film_beta.append(torch.nn.Linear(method_dim, h_dim))
+            in_dim = h_dim
+
+        self.out_linear = torch.nn.Linear(in_dim, out_dim)
+        self.act = torch.nn.SiLU()
+
+        # identity init for FiLM: gamma(z)=0, beta(z)=0
+        for gamma_layer, beta_layer in zip(self.film_gamma, self.film_beta):
+            torch.nn.init.zeros_(gamma_layer.weight)
+            torch.nn.init.zeros_(gamma_layer.bias)
+            torch.nn.init.zeros_(beta_layer.weight)
+            torch.nn.init.zeros_(beta_layer.bias)
+
+    def forward(
+        self,
+        edge_feats: torch.Tensor,
+        method_z: torch.Tensor,
+    ) -> torch.Tensor:
+        x = edge_feats
+        z = method_z.to(edge_feats.dtype)
+
+        for linear, gamma_layer, beta_layer in zip(
+            self.hidden_linears, self.film_gamma, self.film_beta
+        ):
+            x = linear(x)
+            x = self.act(x)
+            gamma = 1.0 + gamma_layer(z)
+            beta = beta_layer(z)
+            x = gamma * x + beta
+
+        return self.out_linear(x)
+
 @compile_mode("script")
 class InteractionBlock(torch.nn.Module):
     def __init__(
@@ -579,6 +635,18 @@ class InteractionBlock(torch.nn.Module):
                 out_dim=out_dim,
             )
 
+        if self.interaction_method == "radial_film":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_film' requires method_emb_dim > 0"
+                )
+            return FiLMConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=self.radial_MLP,
+                out_dim=out_dim,
+            )
+
         raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
     def _compute_conv_tp_weights(
@@ -591,20 +659,20 @@ class InteractionBlock(torch.nn.Module):
         if self.interaction_method == "none":
             return self.conv_tp_weights(edge_feats)
 
-        if self.interaction_method == "radial_concat":
+        if self.interaction_method in ("radial_concat", "radial_film"):
             if method_z is None:
                 raise ValueError(
-                    "interaction_method='radial_concat' requires method_z in forward()"
+                    f"interaction_method='{self.interaction_method}' requires method_z in forward()"
                 )
             if node_batch is None:
                 raise ValueError(
-                    "interaction_method='radial_concat' requires node_batch in forward()"
+                    f"interaction_method='{self.interaction_method}' requires node_batch in forward()"
                 )
             edge_batch = node_batch[edge_index[0]]
             z_edge = method_z[edge_batch]
             return self.conv_tp_weights(edge_feats, z_edge)
 
-        raise ValueError(f"Unknown interaction_method: {self.interaction_method}")    
+        raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
     @abstractmethod
     def forward(
@@ -1185,6 +1253,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
             + 2 * self.node_feats_down_irreps.num_irreps
         )
 
+        # interaction method options
         if self.interaction_method == "none":
             self.conv_tp_weights = nn.FullyConnectedNet(
                 [input_dim] + 3 * [256] + [self.conv_tp.weight_numel],
@@ -1196,6 +1265,17 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
                     "interaction_method='radial_concat' requires method_emb_dim > 0"
                 )
             self.conv_tp_weights = ConcatConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=[256, 256, 256],
+                out_dim=self.conv_tp.weight_numel,
+            )
+        elif self.interaction_method == "radial_film":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_film' requires method_emb_dim > 0"
+                )
+            self.conv_tp_weights = FiLMConditionedRadialMLP(
                 edge_input_dim=input_dim,
                 method_dim=self.method_emb_dim,
                 hidden_dims=[256, 256, 256],
@@ -1235,7 +1315,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
         lammps_class: Optional[Any] = None,
         lammps_natoms: Tuple[int, int] = (0, 0),
         first_layer: bool = False,
-    ) -> Tuple[torch.Tensor, None]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         sender = edge_index[0]
         receiver = edge_index[1]
         sc = self.skip_linear(node_feats)
@@ -1353,6 +1433,17 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
                 hidden_dims=self.radial_MLP,
                 out_dim=self.conv_tp.weight_numel,
             )
+        elif self.interaction_method == "radial_film":
+            if self.method_emb_dim <= 0:
+                raise ValueError(
+                    "interaction_method='radial_film' requires method_emb_dim > 0"
+                )
+            self.conv_tp_weights = FiLMConditionedRadialMLP(
+                edge_input_dim=input_dim,
+                method_dim=self.method_emb_dim,
+                hidden_dims=self.radial_MLP,
+                out_dim=self.conv_tp.weight_numel,
+            )
         else:
             raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
@@ -1410,9 +1501,13 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         )
 
         # Normalizations
+        #self.density_fn = RadialMLP(
+        #    [input_dim + 2 * node_scalar_irreps.dim] + [64] + [1],
+        #)
         self.density_fn = RadialMLP(
-            [input_dim + 2 * node_scalar_irreps.dim] + [64] + [1],
+            [input_dim] + [64] + [1],
         )
+
         self.alpha = torch.nn.Parameter(torch.tensor(20.0), requires_grad=True)
         self.beta = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 

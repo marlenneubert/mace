@@ -120,7 +120,7 @@ class MACE(torch.nn.Module):
         self.method_beta = None
 
         # check
-        if self.interaction_method not in ("none", "radial_concat"):
+        if self.interaction_method not in ("none", "radial_concat", "radial_film"):
             raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
         if self.interaction_method != "none" and self.method_model not in (
@@ -509,6 +509,12 @@ class MACE(torch.nn.Module):
         batch = data["batch"]
         method_idx_graph = self._get_method_idx_graph(data)
         z_graph = self._get_method_z_graph(method_idx_graph)
+        # check
+        if method_idx_graph is not None and method_idx_graph.shape[0] != num_graphs:
+            raise ValueError(
+                f"Expected method_index to have one entry per graph "
+                f"({num_graphs}), got shape {tuple(method_idx_graph.shape)}"
+            )
         # method conditioning input and internal in radial MLP
         if method_idx_graph is not None and self.method_model in (
             "m_bias",
@@ -748,7 +754,13 @@ class ScaleShiftMACE(MACE):
         batch = data["batch"]
         method_idx_graph = self._get_method_idx_graph(data)
         z_graph = self._get_method_z_graph(method_idx_graph)
-
+        # check
+        if method_idx_graph is not None and method_idx_graph.shape[0] != num_graphs:
+            raise ValueError(
+                f"Expected method_index to have one entry per graph "
+                f"({num_graphs}), got shape {tuple(method_idx_graph.shape)}"
+            )
+        
         if method_idx_graph is not None and self.method_model in (
             "m_bias",
             "m_emb",
