@@ -132,26 +132,28 @@ class MACE(torch.nn.Module):
             raise ValueError(f"Unknown interaction_method: {self.interaction_method}")
 
         if self.interaction_method != "none" and self.method_model not in (
+            "m_onehot",
             "m_emb",
             "m_pcafix",
             "m_pcainit",
         ):
             raise ValueError(
                 "interaction_method != 'none' currently requires "
-                "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}"
+                "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}"
             )
 
         if self.readout_method not in ("none", "basis_mix"):
             raise ValueError(f"Unknown readout_method: {self.readout_method}")
 
         if self.readout_method != "none" and self.method_model not in (
+            "m_onehot",
             "m_emb",
             "m_pcafix",
             "m_pcainit",
         ):
             raise ValueError(
                 "readout_method != 'none' currently requires "
-                "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}"
+                "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}"
             )
 
         if self.readout_method != "none" and len(heads) != 1:
@@ -160,15 +162,34 @@ class MACE(torch.nn.Module):
                 "Use heads=None / a single Default head."
             )
 
-
         # Embedding
+        # Keep the original chemical node attrs irreps for interaction/product blocks
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
+
+        # Only widen the input seen by node_embedding for one-hot concat 
+        input_node_attr_dim = num_elements
+        if self.method_model == "m_onehot":
+            if self.num_methods is None or self.num_methods <= 0:
+                raise ValueError("num_methods must be > 0 for method_model='m_onehot'")
+            input_node_attr_dim += self.num_methods
+
+        node_embedding_in_irreps = o3.Irreps([(input_node_attr_dim, (0, 1))])
         node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
+
         self.node_embedding = LinearNodeEmbeddingBlock(
-            irreps_in=node_attr_irreps,
+            irreps_in=node_embedding_in_irreps,
             irreps_out=node_feats_irreps,
             cueq_config=cueq_config,
-        )
+)
+        # Embedding before
+        #node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
+        #node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
+        #self.node_embedding = LinearNodeEmbeddingBlock(
+        #    irreps_in=node_attr_irreps,
+        #    irreps_out=node_feats_irreps,
+        #    cueq_config=cueq_config,
+        #)
+
         embedding_size = node_feats_irreps.count(o3.Irrep(0, 1))
 
         self.embedding_size = embedding_size
@@ -179,6 +200,21 @@ class MACE(torch.nn.Module):
                 raise ValueError("num_methods must be > 0 for method_model='m_bias'")
             # e_m ∈ R^{embedding_size} per method
             self.method_bias = torch.nn.Parameter(torch.zeros(self.num_methods, embedding_size))
+            self.method_embedding = None
+            self.method_pca_table = None
+            self.method_pca = None
+            self.method_mlp = None
+            self.method_gamma = None
+            self.method_beta = None
+
+        elif self.method_model == "m_onehot":
+            if self.num_methods is None or self.num_methods <= 0:
+                raise ValueError("num_methods must be > 0 for method_model='m_onehot'")
+
+            # For internal radial/readout conditioning, raw one-hot itself is the graph vector.
+            self.method_emb_dim = self.num_methods
+
+            self.method_bias = None
             self.method_embedding = None
             self.method_pca_table = None
             self.method_pca = None
@@ -493,13 +529,44 @@ class MACE(torch.nn.Module):
     ) -> Optional[torch.Tensor]:
         if method_idx_graph is None:
             return None
+
+        if self.method_model == "m_onehot":
+            return torch.nn.functional.one_hot(
+                method_idx_graph, num_classes=self.num_methods
+            ).to(dtype=torch.get_default_dtype())
+
         if self.method_model == "m_emb":
             return self.method_embedding(method_idx_graph)
+
         if self.method_model == "m_pcafix":
             return self.method_pca_table[method_idx_graph]
+
         if self.method_model == "m_pcainit":
             return self.method_pca[method_idx_graph]
+
         return None
+
+    def _get_node_embedding_input(
+        self,
+        data: Dict[str, torch.Tensor],
+        method_idx_graph: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        node_attrs = data["node_attrs"]
+
+        if self.method_model != "m_onehot":
+            return node_attrs
+
+        if method_idx_graph is None:
+            raise ValueError(
+                "method_model='m_onehot' requires 'method_index' in the batch."
+            )
+
+        z_graph = self._get_method_z_graph(method_idx_graph)
+        if z_graph is None:
+            raise ValueError("Could not construct one-hot method vectors for m_onehot.")
+
+        z_nodes = z_graph[data["batch"]].to(node_attrs.dtype)
+        return torch.cat([node_attrs, z_nodes], dim=-1)
 
     def forward(
         self,
@@ -545,11 +612,18 @@ class MACE(torch.nn.Module):
             vectors.dtype
         )  # [n_graphs, n_heads]
         # Embeddings
-        node_feats = self.node_embedding(data["node_attrs"])
+        #node_feats = self.node_embedding(data["node_attrs"])
+
+        #batch = data["batch"]
+        #method_idx_graph = self._get_method_idx_graph(data)
+        #z_graph = self._get_method_z_graph(method_idx_graph)
 
         batch = data["batch"]
         method_idx_graph = self._get_method_idx_graph(data)
+        node_input = self._get_node_embedding_input(data, method_idx_graph)
+        node_feats = self.node_embedding(node_input)
         z_graph = self._get_method_z_graph(method_idx_graph)
+        
         # check
         if method_idx_graph is not None and method_idx_graph.shape[0] != num_graphs:
             raise ValueError(
@@ -601,7 +675,7 @@ class MACE(torch.nn.Module):
             if z_graph is None:
                 raise ValueError(
                     "interaction_method != 'none' currently requires "
-                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                    "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}."
                 )
         if self.readout_method != "none":
             if method_idx_graph is None:
@@ -611,7 +685,7 @@ class MACE(torch.nn.Module):
             if z_graph is None:
                 raise ValueError(
                     "readout_method != 'none' currently requires "
-                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                    "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}."
                 )
 
 
@@ -816,10 +890,15 @@ class ScaleShiftMACE(MACE):
 
         # Embeddings
         # input conditioning and internal radial MLP conditioning
-        node_feats = self.node_embedding(data["node_attrs"])
+        #node_feats = self.node_embedding(data["node_attrs"])
 
+        #batch = data["batch"]
+        #method_idx_graph = self._get_method_idx_graph(data)
+        #z_graph = self._get_method_z_graph(method_idx_graph)
         batch = data["batch"]
         method_idx_graph = self._get_method_idx_graph(data)
+        node_input = self._get_node_embedding_input(data, method_idx_graph)
+        node_feats = self.node_embedding(node_input)
         z_graph = self._get_method_z_graph(method_idx_graph)
         # check
         if method_idx_graph is not None and method_idx_graph.shape[0] != num_graphs:
@@ -871,7 +950,7 @@ class ScaleShiftMACE(MACE):
             if z_graph is None:
                 raise ValueError(
                     "interaction_method != 'none' currently requires "
-                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                    "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}."
                 )
         if self.readout_method != "none":
             if method_idx_graph is None:
@@ -881,7 +960,7 @@ class ScaleShiftMACE(MACE):
             if z_graph is None:
                 raise ValueError(
                     "readout_method != 'none' currently requires "
-                    "method_model in {'m_emb', 'm_pcafix', 'm_pcainit'}."
+                    "method_model in {'m_onehot','m_emb', 'm_pcafix', 'm_pcainit'}."
                 )        
 
 

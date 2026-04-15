@@ -344,11 +344,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--method_model",
         type=str,
         default="none",
-        choices=["none", "m_bias", "m_emb", "m_pcafix", "m_pcainit"],
+        choices=["none", "m_bias", "m_emb", "m_onehot", "m_pcafix", "m_pcainit"],
         help=(
             "How to incorporate per-method information. "
-            "'m_bias' = per-method bias vector added to node features; "
-            "'m_emb' = learned embedding + MLP; PCA: To do"
+            "'m_bias'   = learned per-method bias added after node embedding; "
+            "'m_onehot' = raw one-hot method vector concatenated to node input; "
+            "'m_emb'    = learned method embedding; "
+            "'m_pcafix' = fixed PCA/error-profile embedding; "
+            "'m_pcainit'= trainable embedding initialized from PCA/error-profile vectors."
         ),
     )
 
