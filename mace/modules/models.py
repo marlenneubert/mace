@@ -30,7 +30,10 @@ from .blocks import (
     RadialEmbeddingBlock,
     ScaleShiftBlock,
     ContinuousBasisReadoutBlock,
+    ReadoutFiLMBlock,
+    DeltaReadoutFiLMBlock,
 )
+
 from .utils import (
     compute_dielectric_gradients,
     compute_fixed_charge_dipole,
@@ -84,7 +87,7 @@ class MACE(torch.nn.Module):
         method_emb_dim: int = 0,
         method_model: str = "none",
         method_pca_init: Optional[np.ndarray] = None,
-        method_injector: str = "resmlp",
+        method_injector: str = "none",
         interaction_method: str = "none",
         readout_method: str = "none",
         num_readout_basis_heads: int = 4,
@@ -142,8 +145,22 @@ class MACE(torch.nn.Module):
                 "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}"
             )
 
-        if self.readout_method not in ("none", "basis_mix"):
+        if self.readout_method not in ("none", "basis_mix", "readout_film", "delta_readout_film"):
             raise ValueError(f"Unknown readout_method: {self.readout_method}")
+
+        if self.method_injector not in ("none", "onehot_concat", "resmlp", "film"):
+            raise ValueError(f"Unknown method_injector: {self.method_injector}")
+
+        if self.method_injector == "onehot_concat" and self.method_model != "m_onehot":
+            raise ValueError(
+                "method_injector='onehot_concat' is only valid with method_model='m_onehot'."
+            )
+
+        if self.method_model == "m_onehot" and self.method_injector in ("resmlp", "film"):
+            raise ValueError(
+                "m_onehot currently supports method_injector='none' or 'onehot_concat'. "
+                "Use interaction_method/readout_method for one-hot internal/output conditioning."
+            )
 
         if self.readout_method != "none" and self.method_model not in (
             "m_onehot",
@@ -168,7 +185,7 @@ class MACE(torch.nn.Module):
 
         # Only widen the input seen by node_embedding for one-hot concat 
         input_node_attr_dim = num_elements
-        if self.method_model == "m_onehot":
+        if self.method_model == "m_onehot" and self.method_injector == "onehot_concat":
             if self.num_methods is None or self.num_methods <= 0:
                 raise ValueError("num_methods must be > 0 for method_model='m_onehot'")
             input_node_attr_dim += self.num_methods
@@ -240,8 +257,12 @@ class MACE(torch.nn.Module):
                 num_embeddings=self.num_methods,
                 embedding_dim=self.method_emb_dim,
             )
+            if self.method_injector == "none":
+                self.method_mlp = None
+                self.method_gamma = None
+                self.method_beta = None
 
-            if self.method_injector == "resmlp":
+            elif self.method_injector == "resmlp":
                 # residual MLP: [s || z] -> delta_s
                 self.method_mlp = torch.nn.Sequential(
                     torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
@@ -297,7 +318,12 @@ class MACE(torch.nn.Module):
                 # for regularizer
                 self.register_buffer("method_pca_ref", pca.clone())
 
-            if self.method_injector == "resmlp":
+            if self.method_injector == "none":
+                self.method_mlp = None
+                self.method_gamma = None
+                self.method_beta = None
+
+            elif self.method_injector == "resmlp":
                 self.method_mlp = torch.nn.Sequential(
                     torch.nn.Linear(embedding_size + self.method_emb_dim, embedding_size),
                     torch.nn.SiLU(),
@@ -490,6 +516,31 @@ class MACE(torch.nn.Module):
                             oeq_config=oeq_config,
                         )
                     )
+
+                elif self.readout_method == "readout_film":
+                    self.readouts.append(
+                        ReadoutFiLMBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
+                elif self.readout_method == "delta_readout_film":
+                    self.readouts.append(
+                        DeltaReadoutFiLMBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
                 else:
                     self.readouts.append(
                         readout_cls(
@@ -553,7 +604,7 @@ class MACE(torch.nn.Module):
     ) -> torch.Tensor:
         node_attrs = data["node_attrs"]
 
-        if self.method_model != "m_onehot":
+        if not (self.method_model == "m_onehot" and self.method_injector == "onehot_concat"):
             return node_attrs
 
         if method_idx_graph is None:
@@ -631,11 +682,10 @@ class MACE(torch.nn.Module):
                 f"({num_graphs}), got shape {tuple(method_idx_graph.shape)}"
             )
         # method conditioning input and internal in radial MLP
-        if method_idx_graph is not None and self.method_model in (
-            "m_bias",
-            "m_emb",
-            "m_pcafix",
-            "m_pcainit",
+        if (
+            method_idx_graph is not None
+            and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit")
+            and self.method_injector != "none"
         ):
             if self.method_model == "m_bias":
                 e_graph = self.method_bias[method_idx_graph]   # [n_graphs, C0]
@@ -763,7 +813,7 @@ class MACE(torch.nn.Module):
             feat_idx = -1 if len(self.readouts) == 1 else i
             is_last_readout = i == (len(self.readouts) - 1)
 
-            if self.readout_method == "basis_mix" and is_last_readout:
+            if self.readout_method in ("basis_mix", "readout_film", "delta_readout_film") and is_last_readout:
                 node_out = readout(
                     node_feats_concat[feat_idx],
                     method_z=z_graph,
@@ -907,11 +957,10 @@ class ScaleShiftMACE(MACE):
                 f"({num_graphs}), got shape {tuple(method_idx_graph.shape)}"
             )
         
-        if method_idx_graph is not None and self.method_model in (
-            "m_bias",
-            "m_emb",
-            "m_pcafix",
-            "m_pcainit",
+        if (
+            method_idx_graph is not None
+            and self.method_model in ("m_bias", "m_emb", "m_pcafix", "m_pcainit")
+            and self.method_injector != "none"
         ):
             if self.method_model == "m_bias":
                 e_graph = self.method_bias[method_idx_graph]   # [n_graphs, C0]
@@ -1035,7 +1084,7 @@ class ScaleShiftMACE(MACE):
             feat_idx = -1 if len(self.readouts) == 1 else i
             is_last_readout = i == (len(self.readouts) - 1)
 
-            if self.readout_method == "basis_mix" and is_last_readout:
+            if self.readout_method in ("basis_mix", "readout_film", "delta_readout_film") and is_last_readout:
                 node_out = readout(
                     node_feats_list[feat_idx],
                     method_z=z_graph,

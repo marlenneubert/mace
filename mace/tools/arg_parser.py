@@ -348,7 +348,8 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help=(
             "How to incorporate per-method information. "
             "'m_bias'   = learned per-method bias added after node embedding; "
-            "'m_onehot' = raw one-hot method vector concatenated to node input; "
+            "'m_onehot' = raw one-hot method vector; can be concatenated to node input "
+            "only when --method_injector onehot_concat is used; "
             "'m_emb'    = learned method embedding; "
             "'m_pcafix' = fixed PCA/error-profile embedding; "
             "'m_pcainit'= trainable embedding initialized from PCA/error-profile vectors."
@@ -378,10 +379,11 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--method_injector",
         type=str,
-        default="resmlp",
-        choices=["resmlp", "film"],
+        default="none",
+        choices=["none","onehot_concat", "resmlp", "film"],
         help=(
             "How to inject method vector z_m into node scalar features. "
+            "'none' = construct method descriptor z_m but do not inject it at input; "
             "'resmlp' = residual MLP on [s||z]; "
             "'film' = strict FiLM: s <- (1+g(z))*s + b(z) with identity init."
         ),
@@ -406,12 +408,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--readout_method",
         type=str,
         default="none",
-        choices=["none", "basis_mix"],
+        choices=["none", "basis_mix", "readout_film", "delta_readout_film"],
         help=(
             "Optional method conditioning in the final scalar readout. "
             "'none' = standard readout; "
             "'basis_mix' = continuous mixture of K basis readout heads "
             "using the graph-level method vector z_m."
+            "'readout_film' = FiLM-modulate hidden scalar readout features "
+            "using the graph-level method vector z_m."
+            "'delta_readout_film' = standard shared readout plus a zero-initialized "
+            "method-conditioned FiLM correction branch."
         ),
     )
     parser.add_argument(

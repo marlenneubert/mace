@@ -5,8 +5,8 @@
 ###########################################################################################
 
 from abc import abstractmethod
-from typing import Any, Callable, List, Optional, Tuple, Union
-
+from typing import Any, Callable, List, Dict, Optional, Tuple, Union
+import torch
 import numpy as np
 import torch.nn.functional
 from e3nn import nn, o3
@@ -211,6 +211,209 @@ class ContinuousBasisReadoutBlock(torch.nn.Module):
 
         node_e = torch.sum(basis_es * mix_weights_nodes, dim=-1, keepdim=True)
         return node_e  # [n_nodes, 1]
+
+
+# FiLM Readout block
+class ReadoutFiLMBlock(torch.nn.Module):
+    """Final scalar readout with graph-level method FiLM conditioning.
+
+    The block assumes that the final node features are scalar-only, which is
+    already the case for the final MACE readout in your current model setup.
+
+    Equations:
+        h_i = act(W1 x_i)
+        h_i' = (1 + gamma(z_m)) * h_i + beta(z_m)
+        eps_i = W2 h_i'
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+
+        del cueq_config, oeq_config  # not used in this simple scalar-only block
+
+        if method_dim is None or method_dim <= 0:
+            raise ValueError("ReadoutFiLMBlock requires method_dim > 0.")
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "ReadoutFiLMBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if MLP_irreps.lmax > 0:
+            raise ValueError(
+                "ReadoutFiLMBlock expects scalar-only MLP_irreps. "
+                f"Got MLP_irreps={MLP_irreps}."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+        hidden_dim = MLP_irreps.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(f"Could not infer scalar input dim from {irreps_in}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"Could not infer scalar hidden dim from {MLP_irreps}.")
+
+        self.linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        self.method_gamma = torch.nn.Linear(method_dim, hidden_dim)
+        self.method_beta = torch.nn.Linear(method_dim, hidden_dim)
+
+        # Identity FiLM initialization:
+        # gamma(z)=0 and beta(z)=0, so initially h' = h.
+        torch.nn.init.zeros_(self.method_gamma.weight)
+        torch.nn.init.zeros_(self.method_gamma.bias)
+        torch.nn.init.zeros_(self.method_beta.weight)
+        torch.nn.init.zeros_(self.method_beta.bias)
+
+        self.gate = gate
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        method_z: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError("ReadoutFiLMBlock requires method_z.")
+        if node_batch is None:
+            raise ValueError("ReadoutFiLMBlock requires node_batch.")
+
+        h = self.linear_1(x)
+
+        if self.gate is not None:
+            h = self.gate(h)
+
+        z_nodes = method_z[node_batch].to(dtype=h.dtype, device=h.device)
+
+        gamma = 1.0 + self.method_gamma(z_nodes)
+        beta = self.method_beta(z_nodes)
+
+        h = gamma * h + beta
+        return self.linear_2(h)
+
+
+# delta readout film block
+class DeltaReadoutFiLMBlock(torch.nn.Module):
+    """Final scalar readout with a shared base readout plus method-conditioned FiLM correction.
+
+    Equations:
+        eps_i = eps_i_base(R) + delta_eps_i(R, z_m)
+
+        eps_i_base = W2_base act(W1_base x_i)
+
+        h_delta = act(W1_delta x_i)
+        h_delta' = (1 + gamma(z_m)) * h_delta + beta(z_m)
+        delta_eps_i = W2_delta h_delta'
+
+    The correction branch is zero-initialized at the final layer, so initially:
+        delta_eps_i = 0
+    and the block behaves like a standard readout.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+
+        del cueq_config, oeq_config  # unused in this simple scalar-only implementation
+
+        if method_dim is None or method_dim <= 0:
+            raise ValueError("DeltaReadoutFiLMBlock requires method_dim > 0.")
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "DeltaReadoutFiLMBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if MLP_irreps.lmax > 0:
+            raise ValueError(
+                "DeltaReadoutFiLMBlock expects scalar-only MLP_irreps. "
+                f"Got MLP_irreps={MLP_irreps}."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+        hidden_dim = MLP_irreps.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(f"Could not infer scalar input dim from {irreps_in}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"Could not infer scalar hidden dim from {MLP_irreps}.")
+
+        self.gate = gate
+
+        # Shared/base readout branch: standard geometry-only readout
+        self.base_linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.base_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        # Method-conditioned correction branch
+        self.delta_linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.delta_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        self.method_gamma = torch.nn.Linear(method_dim, hidden_dim)
+        self.method_beta = torch.nn.Linear(method_dim, hidden_dim)
+
+        # Identity FiLM initialization:
+        # gamma(z)=0 and beta(z)=0, so h_delta' = h_delta initially.
+        torch.nn.init.zeros_(self.method_gamma.weight)
+        torch.nn.init.zeros_(self.method_gamma.bias)
+        torch.nn.init.zeros_(self.method_beta.weight)
+        torch.nn.init.zeros_(self.method_beta.bias)
+
+        # Crucial: zero-initialize the final correction layer.
+        # This makes delta_eps_i = 0 at initialization.
+        torch.nn.init.zeros_(self.delta_linear_2.weight)
+        torch.nn.init.zeros_(self.delta_linear_2.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        method_z: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError("DeltaReadoutFiLMBlock requires method_z.")
+        if node_batch is None:
+            raise ValueError("DeltaReadoutFiLMBlock requires node_batch.")
+
+        # Base/shared readout
+        h_base = self.base_linear_1(x)
+        if self.gate is not None:
+            h_base = self.gate(h_base)
+        eps_base = self.base_linear_2(h_base)
+
+        # Method-conditioned correction
+        h_delta = self.delta_linear_1(x)
+        if self.gate is not None:
+            h_delta = self.gate(h_delta)
+
+        z_nodes = method_z[node_batch].to(dtype=h_delta.dtype, device=h_delta.device)
+
+        gamma = 1.0 + self.method_gamma(z_nodes)
+        beta = self.method_beta(z_nodes)
+
+        h_delta = gamma * h_delta + beta
+        delta_eps = self.delta_linear_2(h_delta)
+
+        return eps_base + delta_eps
+
+
 
 @simplify_if_compile
 @compile_mode("script")
