@@ -214,6 +214,7 @@ class ContinuousBasisReadoutBlock(torch.nn.Module):
 
 
 # FiLM Readout block
+@compile_mode("script")
 class ReadoutFiLMBlock(torch.nn.Module):
     """Final scalar readout with graph-level method FiLM conditioning.
 
@@ -238,6 +239,9 @@ class ReadoutFiLMBlock(torch.nn.Module):
         super().__init__()
 
         del cueq_config, oeq_config  # not used in this simple scalar-only block
+
+        irreps_in = o3.Irreps(irreps_in)
+        MLP_irreps = o3.Irreps(MLP_irreps)
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("ReadoutFiLMBlock requires method_dim > 0.")
@@ -303,6 +307,7 @@ class ReadoutFiLMBlock(torch.nn.Module):
 
 
 # delta readout film block
+@compile_mode("script")
 class DeltaReadoutFiLMBlock(torch.nn.Module):
     """Final scalar readout with a shared base readout plus method-conditioned FiLM correction.
 
@@ -332,6 +337,9 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
         super().__init__()
 
         del cueq_config, oeq_config  # unused in this simple scalar-only implementation
+
+        irreps_in = o3.Irreps(irreps_in)
+        MLP_irreps = o3.Irreps(MLP_irreps)
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("DeltaReadoutFiLMBlock requires method_dim > 0.")
