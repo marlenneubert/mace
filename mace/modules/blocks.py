@@ -242,7 +242,13 @@ class ReadoutFiLMBlock(torch.nn.Module):
 
         irreps_in = o3.Irreps(irreps_in)
         MLP_irreps = o3.Irreps(MLP_irreps)
+
         self.hidden_irreps = MLP_irreps
+
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("ReadoutFiLMBlock requires method_dim > 0.")
@@ -295,8 +301,7 @@ class ReadoutFiLMBlock(torch.nn.Module):
 
         h = self.linear_1(x)
 
-        if self.gate is not None:
-            h = self.gate(h)
+        h = self.non_linearity(h)
 
         z_nodes = method_z[node_batch].to(dtype=h.dtype, device=h.device)
 
@@ -343,6 +348,11 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
         MLP_irreps = o3.Irreps(MLP_irreps)
         
         self.hidden_irreps = MLP_irreps
+
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )        
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("DeltaReadoutFiLMBlock requires method_dim > 0.")
@@ -404,15 +414,11 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
             raise ValueError("DeltaReadoutFiLMBlock requires node_batch.")
 
         # Base/shared readout
-        h_base = self.base_linear_1(x)
-        if self.gate is not None:
-            h_base = self.gate(h_base)
+        h_base = self.non_linearity(self.base_linear_1(x))
         eps_base = self.base_linear_2(h_base)
 
         # Method-conditioned correction
-        h_delta = self.delta_linear_1(x)
-        if self.gate is not None:
-            h_delta = self.gate(h_delta)
+        h_delta = self.non_linearity(self.delta_linear_1(x))
 
         z_nodes = method_z[node_batch].to(dtype=h_delta.dtype, device=h_delta.device)
 
@@ -457,6 +463,11 @@ class ReadoutResMLPBlock(torch.nn.Module):
         MLP_irreps = o3.Irreps(MLP_irreps)
 
         self.hidden_irreps = MLP_irreps
+
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )        
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("ReadoutResMLPBlock requires method_dim > 0.")
@@ -514,15 +525,12 @@ class ReadoutResMLPBlock(torch.nn.Module):
 
         if self.feature_mode == "hidden":
             h = self.x_project(x)
-            if self.gate is not None:
-                h = self.gate(h)
+            h = self.non_linearity(h)
             h = torch.cat([h, z_nodes], dim=-1)
         else:
             h = torch.cat([x, z_nodes], dim=-1)
 
-        h = self.cond_linear_1(h)
-        if self.gate is not None:
-            h = self.gate(h)
+        h = self.non_linearity(self.cond_linear_1(h))
 
         return self.cond_linear_2(h)
 
@@ -562,6 +570,12 @@ class DeltaReadoutResMLPBlock(torch.nn.Module):
         MLP_irreps = o3.Irreps(MLP_irreps)
 
         self.hidden_irreps = MLP_irreps
+
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )
+
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("DeltaReadoutResMLPBlock requires method_dim > 0.")
@@ -625,26 +639,19 @@ class DeltaReadoutResMLPBlock(torch.nn.Module):
             raise ValueError("DeltaReadoutResMLPBlock requires node_batch.")
 
         # Base/shared readout
-        h_base = self.base_linear_1(x)
-        if self.gate is not None:
-            h_base = self.gate(h_base)
+        h_base = self.non_linearity(self.base_linear_1(x))
         eps_base = self.base_linear_2(h_base)
 
         # Method-conditioned correction
         z_nodes = method_z[node_batch].to(dtype=x.dtype, device=x.device)
 
         if self.feature_mode == "hidden":
-            h_delta = self.delta_project(x)
-            if self.gate is not None:
-                h_delta = self.gate(h_delta)
+            h_delta = self.non_linearity(self.delta_project(x))
             h_delta = torch.cat([h_delta, z_nodes], dim=-1)
         else:
             h_delta = torch.cat([x, z_nodes], dim=-1)
 
-        h_delta = self.delta_linear_1(h_delta)
-        if self.gate is not None:
-            h_delta = self.gate(h_delta)
-
+        h_delta = self.non_linearity(self.delta_linear_1(h_delta))
         delta_eps = self.delta_linear_2(h_delta)
 
         return eps_base + delta_eps
