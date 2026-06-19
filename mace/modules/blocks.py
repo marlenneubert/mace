@@ -421,7 +421,226 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
 
         return eps_base + delta_eps
 
+# ResMLP readout block
+@compile_mode("script")
+class ReadoutResMLPBlock(torch.nn.Module):
+    """Final scalar readout with direct ResMLP method conditioning.
 
+    feature_mode="hidden":
+        h_i = act(W_x x_i)
+        eps_i = MLP([h_i, z_m])
+
+    feature_mode="raw":
+        eps_i = MLP([x_i, z_m])
+
+    This block replaces the standard final nonlinear readout.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        feature_mode: str = "hidden",
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+
+        del cueq_config, oeq_config
+
+        irreps_in = o3.Irreps(irreps_in)
+        MLP_irreps = o3.Irreps(MLP_irreps)
+
+        if method_dim is None or method_dim <= 0:
+            raise ValueError("ReadoutResMLPBlock requires method_dim > 0.")
+
+        if feature_mode not in ("hidden", "raw"):
+            raise ValueError(
+                f"feature_mode must be 'hidden' or 'raw', got {feature_mode}."
+            )
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "ReadoutResMLPBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if MLP_irreps.lmax > 0:
+            raise ValueError(
+                "ReadoutResMLPBlock expects scalar-only MLP_irreps. "
+                f"Got MLP_irreps={MLP_irreps}."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+        hidden_dim = MLP_irreps.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(f"Could not infer scalar input dim from {irreps_in}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"Could not infer scalar hidden dim from {MLP_irreps}.")
+
+        self.gate = gate
+        self.feature_mode = feature_mode
+
+        if feature_mode == "hidden":
+            self.x_project = torch.nn.Linear(in_dim, hidden_dim)
+            mlp_in_dim = hidden_dim + method_dim
+        else:
+            self.x_project = None
+            mlp_in_dim = in_dim + method_dim
+
+        self.cond_linear_1 = torch.nn.Linear(mlp_in_dim, hidden_dim)
+        self.cond_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        method_z: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError("ReadoutResMLPBlock requires method_z.")
+        if node_batch is None:
+            raise ValueError("ReadoutResMLPBlock requires node_batch.")
+
+        z_nodes = method_z[node_batch].to(dtype=x.dtype, device=x.device)
+
+        if self.feature_mode == "hidden":
+            h = self.x_project(x)
+            if self.gate is not None:
+                h = self.gate(h)
+            h = torch.cat([h, z_nodes], dim=-1)
+        else:
+            h = torch.cat([x, z_nodes], dim=-1)
+
+        h = self.cond_linear_1(h)
+        if self.gate is not None:
+            h = self.gate(h)
+
+        return self.cond_linear_2(h)
+
+
+# Delta ResMLP readout block
+@compile_mode("script")
+class DeltaReadoutResMLPBlock(torch.nn.Module):
+    """Shared base readout plus method-conditioned ResMLP correction.
+
+    feature_mode="hidden":
+        eps_i = eps_i_base(x_i) + MLP([h_i, z_m])
+        h_i = act(W_delta x_i)
+
+    feature_mode="raw":
+        eps_i = eps_i_base(x_i) + MLP([x_i, z_m])
+
+    The correction branch is zero-initialized, so initially:
+        delta_eps_i = 0
+    and the block behaves like a standard geometry-only readout.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        feature_mode: str = "hidden",
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+
+        del cueq_config, oeq_config
+
+        irreps_in = o3.Irreps(irreps_in)
+        MLP_irreps = o3.Irreps(MLP_irreps)
+
+        if method_dim is None or method_dim <= 0:
+            raise ValueError("DeltaReadoutResMLPBlock requires method_dim > 0.")
+
+        if feature_mode not in ("hidden", "raw"):
+            raise ValueError(
+                f"feature_mode must be 'hidden' or 'raw', got {feature_mode}."
+            )
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "DeltaReadoutResMLPBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if MLP_irreps.lmax > 0:
+            raise ValueError(
+                "DeltaReadoutResMLPBlock expects scalar-only MLP_irreps. "
+                f"Got MLP_irreps={MLP_irreps}."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+        hidden_dim = MLP_irreps.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(f"Could not infer scalar input dim from {irreps_in}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"Could not infer scalar hidden dim from {MLP_irreps}.")
+
+        self.gate = gate
+        self.feature_mode = feature_mode
+
+        # Base/shared readout branch: standard geometry-only readout
+        self.base_linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.base_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        # Method-conditioned residual branch
+        if feature_mode == "hidden":
+            self.delta_project = torch.nn.Linear(in_dim, hidden_dim)
+            delta_in_dim = hidden_dim + method_dim
+        else:
+            self.delta_project = None
+            delta_in_dim = in_dim + method_dim
+
+        self.delta_linear_1 = torch.nn.Linear(delta_in_dim, hidden_dim)
+        self.delta_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        # Important: start as a standard readout.
+        torch.nn.init.zeros_(self.delta_linear_2.weight)
+        torch.nn.init.zeros_(self.delta_linear_2.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        method_z: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError("DeltaReadoutResMLPBlock requires method_z.")
+        if node_batch is None:
+            raise ValueError("DeltaReadoutResMLPBlock requires node_batch.")
+
+        # Base/shared readout
+        h_base = self.base_linear_1(x)
+        if self.gate is not None:
+            h_base = self.gate(h_base)
+        eps_base = self.base_linear_2(h_base)
+
+        # Method-conditioned correction
+        z_nodes = method_z[node_batch].to(dtype=x.dtype, device=x.device)
+
+        if self.feature_mode == "hidden":
+            h_delta = self.delta_project(x)
+            if self.gate is not None:
+                h_delta = self.gate(h_delta)
+            h_delta = torch.cat([h_delta, z_nodes], dim=-1)
+        else:
+            h_delta = torch.cat([x, z_nodes], dim=-1)
+
+        h_delta = self.delta_linear_1(h_delta)
+        if self.gate is not None:
+            h_delta = self.gate(h_delta)
+
+        delta_eps = self.delta_linear_2(h_delta)
+
+        return eps_base + delta_eps
 
 @simplify_if_compile
 @compile_mode("script")

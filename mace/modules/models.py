@@ -32,6 +32,8 @@ from .blocks import (
     ContinuousBasisReadoutBlock,
     ReadoutFiLMBlock,
     DeltaReadoutFiLMBlock,
+    ReadoutResMLPBlock,
+    DeltaReadoutResMLPBlock,
 )
 
 from .utils import (
@@ -145,7 +147,16 @@ class MACE(torch.nn.Module):
                 "method_model in {'m_onehot', 'm_emb', 'm_pcafix', 'm_pcainit'}"
             )
 
-        if self.readout_method not in ("none", "basis_mix", "readout_film", "delta_readout_film"):
+        if self.readout_method not in (
+            "none",
+            "basis_mix",
+            "readout_film",
+            "delta_readout_film",
+            "readout_resmlp",
+            "readout_resmlp_raw",
+            "delta_readout_resmlp",
+            "delta_readout_resmlp_raw",
+        ):
             raise ValueError(f"Unknown readout_method: {self.readout_method}")
 
         if self.method_injector not in ("none", "onehot_concat", "resmlp", "film"):
@@ -540,6 +551,57 @@ class MACE(torch.nn.Module):
                             oeq_config=oeq_config,
                         )
                     )
+                elif self.readout_method == "readout_resmlp":
+                    self.readouts.append(
+                        ReadoutResMLPBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            feature_mode="hidden",
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
+                elif self.readout_method == "readout_resmlp_raw":
+                    self.readouts.append(
+                        ReadoutResMLPBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            feature_mode="raw",
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
+                elif self.readout_method == "delta_readout_resmlp":
+                    self.readouts.append(
+                        DeltaReadoutResMLPBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            feature_mode="hidden",
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
+                elif self.readout_method == "delta_readout_resmlp_raw":
+                    self.readouts.append(
+                        DeltaReadoutResMLPBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            feature_mode="raw",
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
 
                 else:
                     self.readouts.append(
@@ -813,7 +875,15 @@ class MACE(torch.nn.Module):
             feat_idx = -1 if len(self.readouts) == 1 else i
             is_last_readout = i == (len(self.readouts) - 1)
 
-            if self.readout_method in ("basis_mix", "readout_film", "delta_readout_film") and is_last_readout:
+            if self.readout_method in (
+                "basis_mix",
+                "readout_film",
+                "delta_readout_film",
+                "readout_resmlp",
+                "readout_resmlp_raw",
+                "delta_readout_resmlp",
+                "delta_readout_resmlp_raw",
+            ) and is_last_readout:
                 node_out = readout(
                     node_feats_concat[feat_idx],
                     method_z=z_graph,
@@ -1084,7 +1154,15 @@ class ScaleShiftMACE(MACE):
             feat_idx = -1 if len(self.readouts) == 1 else i
             is_last_readout = i == (len(self.readouts) - 1)
 
-            if self.readout_method in ("basis_mix", "readout_film", "delta_readout_film") and is_last_readout:
+            if self.readout_method in (
+                "basis_mix",
+                "readout_film",
+                "delta_readout_film",
+                "readout_resmlp",
+                "readout_resmlp_raw",
+                "delta_readout_resmlp",
+                "delta_readout_resmlp_raw",
+            ) and is_last_readout:
                 node_out = readout(
                     node_feats_list[feat_idx],
                     method_z=z_graph,

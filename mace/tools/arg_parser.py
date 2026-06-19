@@ -408,7 +408,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--readout_method",
         type=str,
         default="none",
-        choices=["none", "basis_mix", "readout_film", "delta_readout_film"],
+        choices=[
+            "none",
+            "basis_mix",
+            "readout_film",
+            "delta_readout_film",
+            "readout_resmlp",
+            "readout_resmlp_raw",
+            "delta_readout_resmlp",
+            "delta_readout_resmlp_raw",
+        ],
         help=(
             "Optional method conditioning in the final scalar readout. "
             "'none' = standard readout; "
@@ -418,6 +427,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "using the graph-level method vector z_m."
             "'delta_readout_film' = standard shared readout plus a zero-initialized "
             "method-conditioned FiLM correction branch."
+            "'readout_resmlp' = replace the final readout with an MLP on "
+            "[hidden_readout_features || z_m]. "
+            "'readout_resmlp_raw' = replace the final readout with an MLP on "
+            "[raw_final_node_features || z_m]. "
+            "'delta_readout_resmlp' = standard shared readout plus zero-initialized "
+            "MLP correction on [hidden_readout_features || z_m]. "
+            "'delta_readout_resmlp_raw' = standard shared readout plus zero-initialized "
+            "MLP correction on [raw_final_node_features || z_m]."
         ),
     )
     parser.add_argument(
