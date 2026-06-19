@@ -242,6 +242,7 @@ class ReadoutFiLMBlock(torch.nn.Module):
 
         irreps_in = o3.Irreps(irreps_in)
         MLP_irreps = o3.Irreps(MLP_irreps)
+        self.hidden_irreps = MLP_irreps
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("ReadoutFiLMBlock requires method_dim > 0.")
@@ -340,6 +341,8 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
 
         irreps_in = o3.Irreps(irreps_in)
         MLP_irreps = o3.Irreps(MLP_irreps)
+        
+        self.hidden_irreps = MLP_irreps
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("DeltaReadoutFiLMBlock requires method_dim > 0.")
@@ -453,6 +456,8 @@ class ReadoutResMLPBlock(torch.nn.Module):
         irreps_in = o3.Irreps(irreps_in)
         MLP_irreps = o3.Irreps(MLP_irreps)
 
+        self.hidden_irreps = MLP_irreps
+
         if method_dim is None or method_dim <= 0:
             raise ValueError("ReadoutResMLPBlock requires method_dim > 0.")
 
@@ -555,6 +560,8 @@ class DeltaReadoutResMLPBlock(torch.nn.Module):
 
         irreps_in = o3.Irreps(irreps_in)
         MLP_irreps = o3.Irreps(MLP_irreps)
+
+        self.hidden_irreps = MLP_irreps
 
         if method_dim is None or method_dim <= 0:
             raise ValueError("DeltaReadoutResMLPBlock requires method_dim > 0.")
