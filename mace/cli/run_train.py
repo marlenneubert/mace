@@ -73,6 +73,144 @@ from mace.tools.scripts_utils import (
 from mace.tools.tables_utils import create_error_table
 from mace.tools.utils import AtomicNumberTable
 
+# fine tuning helpers for CC fine tuning
+def _torch_load_compat(path, map_location="cpu"):
+    """torch.load wrapper compatible with newer PyTorch weights_only behavior."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def load_exact_finetune_weights(model, path, device):
+    """Load weights from a trained .model or checkpoint into an already-built model."""
+    logging.info(f"Loading exact fine-tuning weights from: {path}")
+
+    obj = _torch_load_compat(path, map_location=device)
+
+    if isinstance(obj, torch.nn.Module):
+        state_dict = obj.state_dict()
+
+    elif isinstance(obj, dict):
+        if "state_dict" in obj:
+            state_dict = obj["state_dict"]
+        elif "model_state_dict" in obj:
+            state_dict = obj["model_state_dict"]
+        elif "model" in obj and isinstance(obj["model"], torch.nn.Module):
+            state_dict = obj["model"].state_dict()
+        else:
+            # Last fallback: assume this is already a state_dict.
+            state_dict = obj
+
+    else:
+        raise TypeError(
+            f"Do not know how to load fine-tune model object of type {type(obj)}"
+        )
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    logging.info(f"Fine-tune load missing keys: {missing}")
+    logging.info(f"Fine-tune load unexpected keys: {unexpected}")
+
+    if len(missing) > 0:
+        logging.warning(
+            "Missing keys found during fine-tune loading. "
+            "This is only okay if you intentionally changed the architecture."
+        )
+
+    if len(unexpected) > 0:
+        logging.warning(
+            "Unexpected keys found during fine-tune loading. "
+            "This is only okay if the saved model contains extra modules."
+        )
+
+    return model
+
+
+def _unfreeze_module(module):
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = True
+
+
+def _unfreeze_parameter(param):
+    if param is None:
+        return
+    if hasattr(param, "requires_grad"):
+        param.requires_grad = True
+
+
+def set_finetune_freeze(model, mode):
+    """Freeze/unfreeze parameters for CC fine-tuning."""
+    if mode == "none":
+        logging.info("Fine-tuning mode: none. Training all parameters.")
+        for param in model.parameters():
+            param.requires_grad = True
+        _log_trainable_parameters(model)
+        return model
+
+    logging.info(f"Fine-tuning freeze mode: {mode}")
+
+    # Freeze everything first.
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Always train readouts for all nontrivial fine-tuning modes.
+    if mode in ("readout_only", "adapter", "adapter_scale_shift"):
+        _unfreeze_module(getattr(model, "readouts", None))
+
+    # Method-conditioning adapters.
+    if mode in ("adapter", "adapter_scale_shift"):
+        _unfreeze_module(getattr(model, "method_embedding", None))
+        _unfreeze_module(getattr(model, "method_mlp", None))
+        _unfreeze_module(getattr(model, "method_gamma", None))
+        _unfreeze_module(getattr(model, "method_beta", None))
+
+        _unfreeze_parameter(getattr(model, "method_bias", None))
+
+        # For m_pcafix this is usually a fixed buffer or absent.
+        # For m_pcainit this may be trainable.
+        _unfreeze_parameter(getattr(model, "method_pca", None))
+
+    # Optional global energy scale/shift adaptation.
+    # Do NOT include this in the default adapter mode.
+    if mode == "adapter_scale_shift":
+        _unfreeze_module(getattr(model, "scale_shift", None))
+
+    _log_trainable_parameters(model)
+    return model
+
+
+def _log_trainable_parameters(model):
+    n_total = sum(p.numel() for p in model.parameters())
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logging.info(f"Trainable parameters after fine-tune freezing: {n_train} / {n_total}")
+    logging.info("Trainable parameter names:")
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logging.info(f"  {name}")
+
+
+def filter_frozen_params_from_param_options(param_options):
+    """Remove frozen parameters from optimizer parameter groups."""
+    filtered_groups = []
+
+    for group in param_options["params"]:
+        group = dict(group)
+        params = list(group["params"])
+        params = [p for p in params if p.requires_grad]
+
+        if len(params) == 0:
+            continue
+
+        group["params"] = params
+        filtered_groups.append(group)
+
+    param_options["params"] = filtered_groups
+    return param_options
 
 def main() -> None:
     """
@@ -702,6 +840,14 @@ def run(args) -> None:
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+
+    if getattr(args, "finetune_model", None) is not None:
+        model = load_exact_finetune_weights(
+            model=model,
+            path=args.finetune_model,
+            device=device,
+        )
+
     if not args.compute_forces:
         assert output_args.get("forces", False) is False, (
             f"compute_forces is False, but output_args['forces']={output_args.get('forces')}. "
@@ -731,17 +877,33 @@ def run(args) -> None:
             "To use OEQ, disable CUEQ with --disable_cueq."
         )
         args.enable_oeq = False
+
     if args.enable_cueq and not args.only_cueq:
         logging.info("Converting model to CUEQ for accelerated training")
         assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
         model = run_e3nn_to_cueq(deepcopy(model), device=device)
+
     if args.enable_oeq:
         logging.info("Converting model to OEQ for accelerated training")
         assert model.__class__.__name__ in ["MACE", "ScaleShiftMACE", "MACELES"]
         model = run_e3nn_to_oeq(deepcopy(model), device=device)
 
+    # Fine-tuning freezing must happen after optional CUEQ/OEQ conversion
+    # and before optimizer creation.
+    if getattr(args, "finetune_model", None) is not None:
+        model = set_finetune_freeze(
+            model=model,
+            mode=getattr(args, "finetune_freeze", "none"),
+        )
+
     # Optimizer
     param_options = get_params_options(args, model)
+
+    # Remove frozen parameters from optimizer groups.
+    # This is important for readout_only / adapter fine-tuning.
+    if getattr(args, "finetune_model", None) is not None:
+        param_options = filter_frozen_params_from_param_options(param_options)
+
     optimizer: torch.optim.Optimizer
     optimizer = get_optimizer(args, param_options)
 

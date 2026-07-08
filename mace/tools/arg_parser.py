@@ -655,6 +655,32 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
     )
+    # CC fine tuning
+    parser.add_argument(
+        "--finetune_model",
+        help=(
+            "Path to an existing trained .model file whose weights are loaded "
+            "exactly before fine-tuning. This is intended for custom conditioned "
+            "MACE fine-tuning, where --foundation_model may not preserve all custom "
+            "conditioning modules."
+        ),
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--finetune_freeze",
+        help=(
+            "Which parameters to train after loading --finetune_model. "
+            "'none' trains all parameters. "
+            "'readout_only' trains only model.readouts. "
+            "'adapter' trains readouts plus method-conditioning modules. "
+            "'adapter_scale_shift' additionally trains model.scale_shift."
+        ),
+        type=str,
+        default="none",
+        choices=["none", "readout_only", "adapter", "adapter_scale_shift"],
+    ) 
 
     # Keys
     parser.add_argument(
