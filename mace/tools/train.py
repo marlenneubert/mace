@@ -769,30 +769,47 @@ def evaluate(
     output_args: Dict[str, bool],
     device: torch.device,
 ) -> Tuple[float, Dict[str, Any]]:
-    for param in model.parameters():
-        param.requires_grad = False
+    # Preserve the fine-tuning freeze configuration.
+    parameters = list(model.parameters())
+    requires_grad_state = [
+        parameter.requires_grad for parameter in parameters
+    ]
 
-    metrics = MACELoss(loss_fn=loss_fn).to(device)
+    try:
+        # Parameter gradients are not needed during validation.
+        # Position gradients can still be used when evaluating forces.
+        for parameter in parameters:
+            parameter.requires_grad_(False)
 
-    start_time = time.time()
-    for batch in data_loader:
-        batch = batch.to(device)
-        batch_dict = batch.to_dict()
-        output = model(
-            batch_dict,
-            training=False,
-            compute_force=output_args["forces"],
-            compute_virials=output_args["virials"],
-            compute_stress=output_args["stress"],
-        )
-        avg_loss, aux = metrics(batch, output)
+        metrics = MACELoss(loss_fn=loss_fn).to(device)
+        start_time = time.time()
 
-    avg_loss, aux = metrics.compute()
-    aux["time"] = time.time() - start_time
-    metrics.reset()
+        for batch in data_loader:
+            batch = batch.to(device)
+            batch_dict = batch.to_dict()
 
-    for param in model.parameters():
-        param.requires_grad = True
+            output = model(
+                batch_dict,
+                training=False,
+                compute_force=output_args["forces"],
+                compute_virials=output_args["virials"],
+                compute_stress=output_args["stress"],
+            )
+
+            metrics(batch, output)
+
+        avg_loss, aux = metrics.compute()
+        aux["time"] = time.time() - start_time
+        metrics.reset()
+
+    finally:
+        # Restore exactly the trainable/frozen state that existed before
+        # validation.
+        for parameter, requires_grad in zip(
+            parameters,
+            requires_grad_state,
+        ):
+            parameter.requires_grad_(requires_grad)
 
     return avg_loss, aux
 

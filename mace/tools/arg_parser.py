@@ -673,14 +673,22 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Which parameters to train after loading --finetune_model. "
             "'none' trains all parameters. "
-            "'readout_only' trains only model.readouts. "
+            "'delta_readout_only' trains only the method-conditioned "
+            "delta correction branch. "
+            "'readout_only' trains all model.readouts. "
             "'adapter' trains readouts plus method-conditioning modules. "
             "'adapter_scale_shift' additionally trains model.scale_shift."
         ),
         type=str,
         default="none",
-        choices=["none", "readout_only", "adapter", "adapter_scale_shift"],
-    ) 
+        choices=[
+            "none",
+            "delta_readout_only",
+            "readout_only",
+            "adapter",
+            "adapter_scale_shift",
+        ],
+    )
 
     # Keys
     parser.add_argument(

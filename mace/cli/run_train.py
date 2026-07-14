@@ -99,7 +99,6 @@ def load_exact_finetune_weights(model, path, device):
         elif "model" in obj and isinstance(obj["model"], torch.nn.Module):
             state_dict = obj["model"].state_dict()
         else:
-            # Last fallback: assume this is already a state_dict.
             state_dict = obj
 
     else:
@@ -107,22 +106,14 @@ def load_exact_finetune_weights(model, path, device):
             f"Do not know how to load fine-tune model object of type {type(obj)}"
         )
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
 
-    logging.info(f"Fine-tune load missing keys: {missing}")
-    logging.info(f"Fine-tune load unexpected keys: {unexpected}")
-
-    if len(missing) > 0:
-        logging.warning(
-            "Missing keys found during fine-tune loading. "
-            "This is only okay if you intentionally changed the architecture."
-        )
-
-    if len(unexpected) > 0:
-        logging.warning(
-            "Unexpected keys found during fine-tune loading. "
-            "This is only okay if the saved model contains extra modules."
-        )
+    logging.info(
+        "Fine-tune model weights loaded successfully with strict=True."
+    )
 
     return model
 
@@ -140,43 +131,127 @@ def _unfreeze_parameter(param):
     if hasattr(param, "requires_grad"):
         param.requires_grad = True
 
+def _unfreeze_delta_readout_only(model):
+    """Unfreeze only the method-conditioned delta-readout branch."""
+
+    readouts = getattr(model, "readouts", None)
+
+    if readouts is None:
+        raise ValueError(
+            "delta_readout_only requested, but model has no readouts."
+        )
+
+    unfrozen_modules = []
+
+    for readout_index, readout in enumerate(readouts):
+        # DeltaReadoutFiLMBlock correction branch.
+        #
+        # Shared geometry-only branch:
+        #   base_linear_1
+        #   base_linear_2
+        #
+        # Method-conditioned correction branch:
+        #   delta_linear_1
+        #   delta_linear_2
+        #   method_gamma
+        #   method_beta
+        for module_name in (
+            "delta_linear_1",
+            "delta_linear_2",
+            "method_gamma",
+            "method_beta",
+        ):
+            module = getattr(readout, module_name, None)
+
+            if module is not None:
+                _unfreeze_module(module)
+                unfrozen_modules.append(
+                    f"readouts.{readout_index}.{module_name}"
+                )
+
+    if not unfrozen_modules:
+        raise ValueError(
+            "finetune_freeze='delta_readout_only' was requested, "
+            "but no DeltaReadoutFiLMBlock correction modules were found."
+        )
+
+    logging.info(
+        "Unfrozen delta-readout modules: "
+        + ", ".join(unfrozen_modules)
+    )
 
 def set_finetune_freeze(model, mode):
     """Freeze/unfreeze parameters for CC fine-tuning."""
+
     if mode == "none":
-        logging.info("Fine-tuning mode: none. Training all parameters.")
+        logging.info(
+            "Fine-tuning mode: none. Training all parameters."
+        )
+
         for param in model.parameters():
             param.requires_grad = True
+
         _log_trainable_parameters(model)
         return model
 
     logging.info(f"Fine-tuning freeze mode: {mode}")
 
-    # Freeze everything first.
+    # Freeze the complete model first.
     for param in model.parameters():
         param.requires_grad = False
 
-    # Always train readouts for all nontrivial fine-tuning modes.
-    if mode in ("readout_only", "adapter", "adapter_scale_shift"):
-        _unfreeze_module(getattr(model, "readouts", None))
+    if mode == "delta_readout_only":
+        # Only the method-conditioned delta correction is trainable.
+        # The shared geometry-only readout remains frozen.
+        _unfreeze_delta_readout_only(model)
 
-    # Method-conditioning adapters.
-    if mode in ("adapter", "adapter_scale_shift"):
-        _unfreeze_module(getattr(model, "method_embedding", None))
-        _unfreeze_module(getattr(model, "method_mlp", None))
-        _unfreeze_module(getattr(model, "method_gamma", None))
-        _unfreeze_module(getattr(model, "method_beta", None))
+    elif mode == "readout_only":
+        # All readouts become trainable, including:
+        # - intermediate readouts;
+        # - base branch of the final readout;
+        # - delta branch of the final readout.
+        _unfreeze_module(
+            getattr(model, "readouts", None)
+        )
 
-        _unfreeze_parameter(getattr(model, "method_bias", None))
+    elif mode in ("adapter", "adapter_scale_shift"):
+        # Train all readouts.
+        _unfreeze_module(
+            getattr(model, "readouts", None)
+        )
 
-        # For m_pcafix this is usually a fixed buffer or absent.
-        # For m_pcainit this may be trainable.
-        _unfreeze_parameter(getattr(model, "method_pca", None))
+        # Train method-conditioning modules.
+        _unfreeze_module(
+            getattr(model, "method_embedding", None)
+        )
+        _unfreeze_module(
+            getattr(model, "method_mlp", None)
+        )
+        _unfreeze_module(
+            getattr(model, "method_gamma", None)
+        )
+        _unfreeze_module(
+            getattr(model, "method_beta", None)
+        )
+        _unfreeze_parameter(
+            getattr(model, "method_bias", None)
+        )
 
-    # Optional global energy scale/shift adaptation.
-    # Do NOT include this in the default adapter mode.
+        # Relevant for m_pcainit.
+        # m_pcafix uses a fixed buffer, so its descriptor remains fixed.
+        _unfreeze_parameter(
+            getattr(model, "method_pca", None)
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown finetune_freeze mode: {mode}"
+        )
+
     if mode == "adapter_scale_shift":
-        _unfreeze_module(getattr(model, "scale_shift", None))
+        _unfreeze_module(
+            getattr(model, "scale_shift", None)
+        )
 
     _log_trainable_parameters(model)
     return model
