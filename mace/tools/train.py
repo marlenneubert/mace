@@ -342,6 +342,10 @@ def train(
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
+
+    # Non-distributed runs need a normal Python flag.
+    stop_training = False
+
     while epoch < max_num_epochs:
         # LR scheduler and SWA update
         if swa is None or epoch < swa.start:
@@ -509,10 +513,16 @@ def train(
                             epoch = swa.start
                         else:
                             logging.info(
-                                f"Stopping optimization after {patience_counter} epochs without improvement"
+                                f"Stopping optimization after {patience_counter} "
+                                "validation evaluations without improvement"
                             )
-                            if exit_now is not None:
+
+                            if distributed:
+                                # Rank 0 tells all other ranks to stop.
                                 exit_now.fill_(1)
+                            else:
+                                # Single-process training stops locally.
+                                stop_training = True
                     if save_all_checkpoints:
                         param_context = (
                             ema.average_parameters()
@@ -540,10 +550,13 @@ def train(
                         keep_last = False or save_all_checkpoints
         if distributed:
             torch.distributed.barrier()
-        if exit_now is not None:
             torch.distributed.broadcast(exit_now, src=0)
-            if exit_now == 1:
+
+            if exit_now.item() == 1:
                 break
+
+        elif stop_training:
+            break
 
         epoch += 1
 
