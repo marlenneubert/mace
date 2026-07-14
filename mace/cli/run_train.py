@@ -105,6 +105,49 @@ def load_exact_finetune_weights(model, path, device):
         raise TypeError(
             f"Do not know how to load fine-tune model object of type {type(obj)}"
         )
+    
+    # Normalize scalar versus one-element scale/shift buffers.
+    #
+    # Older single-head checkpoints can store:
+    #     scale_shift.scale.shape == torch.Size([])
+    #
+    # while the current one-head model construction can create:
+    #     scale_shift.scale.shape == torch.Size([1])
+    #
+    # These representations are mathematically equivalent. Only allow this
+    # conversion when both tensors contain exactly one value. All other
+    # checkpoint keys remain strictly checked.
+
+    target_state_dict = model.state_dict()
+
+    for key in (
+        "scale_shift.scale",
+        "scale_shift.shift",
+    ):
+        if key not in state_dict or key not in target_state_dict:
+            continue
+
+        source_tensor = state_dict[key]
+        target_tensor = target_state_dict[key]
+
+        if source_tensor.shape == target_tensor.shape:
+            continue
+
+        if source_tensor.numel() == 1 and target_tensor.numel() == 1:
+            logging.info(
+                "Reshaping fine-tune checkpoint buffer %s from %s to %s",
+                key,
+                tuple(source_tensor.shape),
+                tuple(target_tensor.shape),
+            )
+            state_dict[key] = source_tensor.reshape(target_tensor.shape)
+
+        else:
+            raise RuntimeError(
+                f"Incompatible fine-tune checkpoint shape for {key}: "
+                f"checkpoint={tuple(source_tensor.shape)}, "
+                f"current_model={tuple(target_tensor.shape)}"
+            )
 
     model.load_state_dict(
         state_dict,
