@@ -377,6 +377,29 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--method_descriptor_adapter",
+        type=str,
+        default="none",
+        choices=["none", "residual_low_rank"],
+        help=(
+            "Optional shared transformation of the method descriptor before "
+            "all method-conditioning locations. "
+            "'none' preserves the raw descriptor. "
+            "'residual_low_rank' applies an identity-initialized low-rank "
+            "residual MLP."
+        ),
+    )
+
+    parser.add_argument(
+        "--method_descriptor_adapter_rank",
+        type=int,
+        default=4,
+        help=(
+            "Bottleneck rank of the residual low-rank method descriptor adapter."
+        ),
+    )
+
+    parser.add_argument(
         "--method_injector",
         type=str,
         default="none",
@@ -457,7 +480,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method_pca_reg_weight", type=float, default=0.0)
     parser.add_argument("--method_pca_freeze_epochs", type=int, default=0)
 
-
+    # shared descriptor-adapter regularizer
+    parser.add_argument(
+        "--method_descriptor_adapter_reg_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the identity regularizer keeping adapted method "
+            "descriptors close to their original fixed descriptors."
+        ),
+    )
 
 
     # Dataset

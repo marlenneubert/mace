@@ -47,6 +47,42 @@ from .utils import (
     prepare_graph,
 )
 
+class ResidualLowRankMethodAdapter(torch.nn.Module):
+    """
+    Shared, identity-initialized transformation of method descriptors.
+
+    The same function is applied to every method:
+        z_adapted = z_raw + delta(z_raw)
+
+    The final layer is initialized to zero, so initially:
+        z_adapted == z_raw
+    """
+
+    def __init__(self, descriptor_dim: int, rank: int = 4):
+        super().__init__()
+
+        if descriptor_dim <= 0:
+            raise ValueError(
+                "descriptor_dim must be positive for the method descriptor adapter"
+            )
+
+        if rank <= 0:
+            raise ValueError(
+                "method descriptor adapter rank must be positive"
+            )
+
+        self.down = torch.nn.Linear(descriptor_dim, rank)
+        self.up = torch.nn.Linear(rank, descriptor_dim)
+
+        # Identity initialization:
+        # delta(z) = 0 at the start of training.
+        torch.nn.init.zeros_(self.up.weight)
+        torch.nn.init.zeros_(self.up.bias)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        delta = self.up(torch.tanh(self.down(z)))
+        return z + delta
+
 
 @compile_mode("script")
 class MACE(torch.nn.Module):
@@ -89,6 +125,8 @@ class MACE(torch.nn.Module):
         method_emb_dim: int = 0,
         method_model: str = "none",
         method_pca_init: Optional[np.ndarray] = None,
+        method_descriptor_adapter: str = "none",
+        method_descriptor_adapter_rank: int = 4,    
         method_injector: str = "none",
         interaction_method: str = "none",
         readout_method: str = "none",
@@ -122,6 +160,10 @@ class MACE(torch.nn.Module):
         self.method_model = method_model  # "none", "m_bias", "m_emb", ...
         self.num_methods = num_methods
         self.method_emb_dim = method_emb_dim
+
+        self.method_descriptor_adapter_type = method_descriptor_adapter
+        self.method_descriptor_adapter_rank = method_descriptor_adapter_rank
+
         #self.method_pca_init = method_pca_init
         self.method_injector = method_injector
         self.interaction_method = interaction_method
@@ -188,6 +230,26 @@ class MACE(torch.nn.Module):
             raise ValueError(
                 "The first continuous readout implementation assumes len(heads) == 1. "
                 "Use heads=None / a single Default head."
+            )
+        
+        if self.method_descriptor_adapter_type not in (
+            "none",
+            "residual_low_rank",
+        ):
+            raise ValueError(
+                "Unknown method_descriptor_adapter: "
+                f"{self.method_descriptor_adapter_type}. "
+                "Supported values are 'none' and 'residual_low_rank'."
+            )
+
+        if (
+            self.method_descriptor_adapter_type != "none"
+            and self.method_model != "m_pcafix"
+        ):
+            raise ValueError(
+                "A learned method descriptor adapter currently requires "
+                "method_model='m_pcafix'. Do not combine it with m_pcainit "
+                "in the first experiments."
             )
 
         # Embedding
@@ -367,7 +429,37 @@ class MACE(torch.nn.Module):
             self.method_gamma = None
             self.method_beta = None
 
+        # --- shared method descriptor adapter ---
+        #
+        # This transforms the graph-level method descriptor once.
+        # The transformed descriptor is subsequently reused by all existing
+        # conditioning locations: input, interaction blocks and readout.
+        if self.method_descriptor_adapter_type == "none":
+            self.method_descriptor_adapter = torch.nn.Identity()
 
+        elif self.method_descriptor_adapter_type == "residual_low_rank":
+            if self.method_model != "m_pcafix":
+                raise ValueError(
+                    "method_descriptor_adapter='residual_low_rank' requires "
+                    "method_model='m_pcafix'."
+                )
+
+            if self.method_emb_dim is None or self.method_emb_dim <= 0:
+                raise ValueError(
+                    "method_emb_dim must be positive when using a method "
+                    "descriptor adapter."
+                )
+
+            self.method_descriptor_adapter = ResidualLowRankMethodAdapter(
+                descriptor_dim=self.method_emb_dim,
+                rank=self.method_descriptor_adapter_rank,
+            )
+
+        else:
+            raise ValueError(
+                "Unknown method_descriptor_adapter: "
+                f"{self.method_descriptor_adapter_type}"
+            )
 
 
 
@@ -643,21 +735,32 @@ class MACE(torch.nn.Module):
         if method_idx_graph is None:
             return None
 
+        z_raw: Optional[torch.Tensor] = None
+
         if self.method_model == "m_onehot":
-            return torch.nn.functional.one_hot(
-                method_idx_graph, num_classes=self.num_methods
+            z_raw = torch.nn.functional.one_hot(
+                method_idx_graph,
+                num_classes=self.num_methods,
             ).to(dtype=torch.get_default_dtype())
 
-        if self.method_model == "m_emb":
-            return self.method_embedding(method_idx_graph)
+        elif self.method_model == "m_emb":
+            z_raw = self.method_embedding(method_idx_graph)
 
-        if self.method_model == "m_pcafix":
-            return self.method_pca_table[method_idx_graph]
+        elif self.method_model == "m_pcafix":
+            z_raw = self.method_pca_table[method_idx_graph]
 
-        if self.method_model == "m_pcainit":
-            return self.method_pca[method_idx_graph]
+        elif self.method_model == "m_pcainit":
+            z_raw = self.method_pca[method_idx_graph]
 
-        return None
+        if z_raw is None:
+            return None
+
+        # Compatibility with older full model objects that were saved before
+        # method_descriptor_adapter existed.
+        if hasattr(self, "method_descriptor_adapter"):
+            return self.method_descriptor_adapter(z_raw)
+
+        return z_raw
 
     def _get_node_embedding_input(
         self,

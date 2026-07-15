@@ -262,6 +262,51 @@ def _method_pca_reg_term(model: torch.nn.Module) -> Optional[torch.Tensor]:
 
     return (method_pca - method_pca_ref).pow(2).mean()
 
+def _method_descriptor_adapter_reg_term(
+    model: torch.nn.Module,
+) -> Optional[torch.Tensor]:
+    """
+    Identity regularizer for the shared method descriptor adapter.
+
+    Computes the adapter displacement on the complete fixed descriptor table:
+
+        mean(((adapter(z) - z) / scale) ** 2)
+
+    Component-wise scaling prevents high-variance PCA dimensions from
+    dominating the penalty.
+    """
+
+    base = _unwrap_model(model)
+
+    adapter_type = getattr(
+        base,
+        "method_descriptor_adapter_type",
+        "none",
+    )
+
+    if adapter_type == "none":
+        return None
+
+    z_raw = getattr(base, "method_pca_table", None)
+    adapter = getattr(base, "method_descriptor_adapter", None)
+
+    if z_raw is None or adapter is None:
+        return None
+
+    z_adapted = adapter(z_raw)
+    delta = z_adapted - z_raw
+
+    # Calculate scale from the fixed descriptor table.
+    # clamp_min prevents division by zero for constant descriptor columns.
+    descriptor_scale = (
+        z_raw.detach()
+        .std(dim=0, unbiased=False)
+        .clamp_min(1.0e-8)
+    )
+
+    delta_scaled = delta / descriptor_scale
+
+    return delta_scaled.pow(2).mean()
 
 def _apply_method_pca_freeze(model: torch.nn.Module, freeze: bool) -> None:
     """
@@ -306,6 +351,7 @@ def train(
     rank: Optional[int] = 0,
     method_pca_reg_weight: float = 0.0,
     method_pca_freeze_epochs: int = 0,
+    method_descriptor_adapter_reg_weight: float = 0.0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -390,6 +436,7 @@ def train(
             distributed_model=distributed_model,
             rank=rank,
             method_pca_reg_weight=method_pca_reg_weight,
+            method_descriptor_adapter_reg_weight=(method_descriptor_adapter_reg_weight),
         )
         if distributed:
             torch.distributed.barrier()
@@ -578,6 +625,7 @@ def train_one_epoch(
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
     method_pca_reg_weight: float = 0.0,
+    method_descriptor_adapter_reg_weight: float = 0.0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -594,6 +642,7 @@ def train_one_epoch(
             distributed=distributed,
             rank=rank,
             method_pca_reg_weight=method_pca_reg_weight,
+            method_descriptor_adapter_reg_weight=method_descriptor_adapter_reg_weight,
         )
         opt_metrics["mode"] = "opt"
         opt_metrics["epoch"] = epoch
@@ -611,6 +660,7 @@ def train_one_epoch(
                 max_grad_norm=max_grad_norm,
                 device=device,
                 method_pca_reg_weight=method_pca_reg_weight,
+                method_descriptor_adapter_reg_weight=method_descriptor_adapter_reg_weight,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -628,6 +678,7 @@ def take_step(
     max_grad_norm: Optional[float],
     device: torch.device,
     method_pca_reg_weight: float = 0.0,
+    method_descriptor_adapter_reg_weight: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -649,6 +700,14 @@ def take_step(
             if reg is not None:
                 loss = loss + method_pca_reg_weight * reg
 
+        if method_descriptor_adapter_reg_weight > 0.0:
+            adapter_reg = _method_descriptor_adapter_reg_term(model)
+
+            if adapter_reg is not None:
+                loss = (
+                    loss
+                    + method_descriptor_adapter_reg_weight * adapter_reg
+                )
 
         loss.backward()
         if max_grad_norm is not None:
@@ -682,6 +741,7 @@ def take_step_lbfgs(
     distributed: bool,
     rank: int,
     method_pca_reg_weight: float = 0.0,
+    method_descriptor_adapter_reg_weight: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     logging.debug(
@@ -736,7 +796,20 @@ def take_step_lbfgs(
                 scaled_reg = method_pca_reg_weight * reg
                 scaled_reg.backward()
                 total_loss = total_loss + scaled_reg.detach()
-        
+
+        if method_descriptor_adapter_reg_weight > 0.0:
+            adapter_reg = _method_descriptor_adapter_reg_term(model)
+
+            if adapter_reg is not None:
+                scaled_adapter_reg = (
+                    method_descriptor_adapter_reg_weight
+                    * adapter_reg
+                )
+                scaled_adapter_reg.backward()
+                total_loss = (
+                    total_loss
+                    + scaled_adapter_reg.detach()
+                )       
 
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)

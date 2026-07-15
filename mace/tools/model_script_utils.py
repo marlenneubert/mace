@@ -188,6 +188,16 @@ def configure_model(
             num_methods=getattr(args, "num_methods", 0),
             method_emb_dim=getattr(args, "method_emb_dim", 0),
             method_model=getattr(args, "method_model", "none"),
+            method_descriptor_adapter=getattr(
+                args,
+                "method_descriptor_adapter",
+                "none",
+            ),
+            method_descriptor_adapter_rank=getattr(
+                args,
+                "method_descriptor_adapter_rank",
+                4,
+            ),
             method_injector=getattr(args, "method_injector", "none"),
             interaction_method=getattr(args, "interaction_method", "none"),
             method_pca_init=None,

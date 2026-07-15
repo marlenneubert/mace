@@ -263,6 +263,11 @@ def set_finetune_freeze(model, mode):
             getattr(model, "readouts", None)
         )
 
+        # Train the shared method descriptor adapter, if present.
+        _unfreeze_module(
+            getattr(model, "method_descriptor_adapter", None)
+        )
+
         # Train method-conditioning modules.
         _unfreeze_module(
             getattr(model, "method_embedding", None)
@@ -1175,7 +1180,7 @@ def run(args) -> None:
         rank=rank,
         method_pca_reg_weight=getattr(args, "method_pca_reg_weight", 0.0),
         method_pca_freeze_epochs=getattr(args, "method_pca_freeze_epochs", 0),
-
+        method_descriptor_adapter_reg_weight=getattr(args,"method_descriptor_adapter_reg_weight",0.0,),
     )
 
     logging.info("")
