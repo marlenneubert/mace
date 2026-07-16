@@ -911,6 +911,20 @@ def get_params_options(
             }
         )
 
+    # Shared method-descriptor adapter
+    if (
+        hasattr(model, "method_descriptor_adapter")
+        and model.method_descriptor_adapter is not None
+    ):
+        method_param_groups.append(
+            {
+                "name": "method_descriptor_adapter",
+                "params": model.method_descriptor_adapter.parameters(),
+                "weight_decay": args.weight_decay,
+            }
+        )
+    
+
     # Only add if non-empty
     if len(method_param_groups) > 0:
         param_options["params"].extend(method_param_groups)    
