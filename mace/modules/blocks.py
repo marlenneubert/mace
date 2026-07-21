@@ -430,6 +430,132 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
 
         return eps_base + delta_eps
 
+@compile_mode("script")
+class CCAnchoredLinearReadoutBlock(torch.nn.Module):
+    """Final scalar readout anchored at the CC method coordinate.
+
+    For atom i and method m:
+
+        e_i,m = e_i,anchor(R) + a_i(R)^T x_m
+
+    where:
+
+        x_m = z_m - z_CC
+
+    At the CC coordinate, x_CC = 0, so:
+
+        e_i,CC = e_i,anchor(R)
+
+    Both the anchor energy and method-response vector are geometry dependent.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        method_dim: int,
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+
+        del cueq_config, oeq_config
+
+        irreps_in = o3.Irreps(irreps_in)
+        MLP_irreps = o3.Irreps(MLP_irreps)
+
+        if method_dim is None or method_dim <= 0:
+            raise ValueError(
+                "CCAnchoredLinearReadoutBlock requires method_dim > 0."
+            )
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "CCAnchoredLinearReadoutBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if MLP_irreps.lmax > 0:
+            raise ValueError(
+                "CCAnchoredLinearReadoutBlock expects scalar-only MLP_irreps. "
+                f"Got MLP_irreps={MLP_irreps}."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+        hidden_dim = MLP_irreps.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(
+                f"Could not infer scalar input dimension from {irreps_in}."
+            )
+
+        if hidden_dim <= 0:
+            raise ValueError(
+                f"Could not infer scalar hidden dimension from {MLP_irreps}."
+            )
+
+        self.hidden_irreps = MLP_irreps
+        self.method_dim = method_dim
+
+        self.non_linearity = simplify_if_compile(nn.Activation)(
+            irreps_in=self.hidden_irreps,
+            acts=[gate],
+        )
+
+        # Geometry-only CC-anchor branch:
+        # e_i,anchor(R)
+        self.anchor_linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.anchor_linear_2 = torch.nn.Linear(hidden_dim, 1)
+
+        # Geometry-dependent method response:
+        # a_i(R) in R^method_dim
+        self.response_linear_1 = torch.nn.Linear(in_dim, hidden_dim)
+        self.response_linear_2 = torch.nn.Linear(hidden_dim, method_dim)
+
+        # Start as a method-independent geometry model.
+        torch.nn.init.zeros_(self.response_linear_2.weight)
+        torch.nn.init.zeros_(self.response_linear_2.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        method_z: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if method_z is None:
+            raise ValueError(
+                "CCAnchoredLinearReadoutBlock requires method_z."
+            )
+
+        if node_batch is None:
+            raise ValueError(
+                "CCAnchoredLinearReadoutBlock requires node_batch."
+            )
+
+        # Geometry-only anchor energy
+        h_anchor = self.non_linearity(self.anchor_linear_1(x))
+        anchor_node_energy = self.anchor_linear_2(h_anchor)
+
+        # Geometry-dependent response vector
+        h_response = self.non_linearity(self.response_linear_1(x))
+        method_response = self.response_linear_2(h_response)
+
+        # Graph-level shifted method descriptor -> node level
+        z_nodes = method_z[node_batch].to(
+            dtype=method_response.dtype,
+            device=method_response.device,
+        )
+
+        method_correction = torch.sum(
+            method_response * z_nodes,
+            dim=-1,
+            keepdim=True,
+        )
+
+        return anchor_node_energy + method_correction
+
+
 # ResMLP readout block
 @compile_mode("script")
 class ReadoutResMLPBlock(torch.nn.Module):

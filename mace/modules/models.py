@@ -34,6 +34,7 @@ from .blocks import (
     DeltaReadoutFiLMBlock,
     ReadoutResMLPBlock,
     DeltaReadoutResMLPBlock,
+    CCAnchoredLinearReadoutBlock,
 )
 
 from .utils import (
@@ -130,6 +131,7 @@ class MACE(torch.nn.Module):
         method_injector: str = "none",
         interaction_method: str = "none",
         readout_method: str = "none",
+        cc_method_index: int = -1,
         num_readout_basis_heads: int = 4,
         readout_mixer_hidden_dim: int = 0,        
     ):
@@ -160,6 +162,7 @@ class MACE(torch.nn.Module):
         self.method_model = method_model  # "none", "m_bias", "m_emb", ...
         self.num_methods = num_methods
         self.method_emb_dim = method_emb_dim
+        self.cc_method_index = int(cc_method_index)
 
         self.method_descriptor_adapter_type = method_descriptor_adapter
         self.method_descriptor_adapter_rank = method_descriptor_adapter_rank
@@ -198,6 +201,7 @@ class MACE(torch.nn.Module):
             "readout_resmlp_raw",
             "delta_readout_resmlp",
             "delta_readout_resmlp_raw",
+            "cc_anchored_linear",
         ):
             raise ValueError(f"Unknown readout_method: {self.readout_method}")
 
@@ -251,6 +255,23 @@ class MACE(torch.nn.Module):
                 "method_model='m_pcafix'. Do not combine it with m_pcainit "
                 "in the first experiments."
             )
+        
+        if self.cc_method_index >= self.num_methods:
+            raise ValueError(
+                f"cc_method_index={self.cc_method_index} must be smaller than "
+                f"num_methods={self.num_methods}."
+            )
+
+        if self.readout_method == "cc_anchored_linear":
+            if self.cc_method_index < 0:
+                raise ValueError(
+                    "readout_method='cc_anchored_linear' requires cc_method_index >= 0."
+                )
+            if self.method_model != "m_pcafix":
+                raise ValueError(
+                    "The initial cc_anchored_linear implementation requires "
+                    "method_model='m_pcafix'."
+                )
 
         # Embedding
         # Keep the original chemical node attrs irreps for interaction/product blocks
@@ -643,6 +664,18 @@ class MACE(torch.nn.Module):
                             oeq_config=oeq_config,
                         )
                     )
+                elif self.readout_method == "cc_anchored_linear":
+                    self.readouts.append(
+                        CCAnchoredLinearReadoutBlock(
+                            hidden_irreps_out,
+                            MLP_irreps.simplify(),
+                            gate,
+                            method_dim=self.method_emb_dim,
+                            cueq_config=cueq_config,
+                            oeq_config=oeq_config,
+                        )
+                    )
+
                 elif self.readout_method == "readout_resmlp":
                     self.readouts.append(
                         ReadoutResMLPBlock(
@@ -755,12 +788,54 @@ class MACE(torch.nn.Module):
         if z_raw is None:
             return None
 
-        # Compatibility with older full model objects that were saved before
-        # method_descriptor_adapter existed.
+        # Apply the existing shared descriptor adapter.
         if hasattr(self, "method_descriptor_adapter"):
-            return self.method_descriptor_adapter(z_raw)
+            z_graph = self.method_descriptor_adapter(z_raw)
+        else:
+            z_graph = z_raw
 
-        return z_raw
+        # Compatibility with models saved before cc_method_index existed.
+        cc_method_index = (
+            self.cc_method_index if hasattr(self, "cc_method_index") else -1
+        )
+
+        if cc_method_index >= 0:
+            cc_index = method_idx_graph.new_tensor([cc_method_index])
+
+            if self.method_model == "m_pcafix":
+                z_cc_raw = self.method_pca_table[cc_index]
+
+            elif self.method_model == "m_pcainit":
+                z_cc_raw = self.method_pca[cc_index]
+
+            elif self.method_model == "m_emb":
+                z_cc_raw = self.method_embedding(cc_index)
+
+            elif self.method_model == "m_onehot":
+                z_cc_raw = torch.nn.functional.one_hot(
+                    cc_index,
+                    num_classes=self.num_methods,
+                ).to(dtype=torch.get_default_dtype())
+
+            else:
+                raise ValueError(
+                    "Cannot construct a CC-centered descriptor for "
+                    f"method_model={self.method_model!r}."
+                )
+
+            if hasattr(self, "method_descriptor_adapter"):
+                z_cc = self.method_descriptor_adapter(z_cc_raw)
+            else:
+                z_cc = z_cc_raw
+
+            # Anchor-preserving transform:
+            # x_m = g(z_m) - g(z_CC)
+            z_graph = z_graph - z_cc.to(
+                dtype=z_graph.dtype,
+                device=z_graph.device,
+            )
+
+        return z_graph
 
     def _get_node_embedding_input(
         self,
@@ -986,6 +1061,7 @@ class MACE(torch.nn.Module):
                 "readout_resmlp_raw",
                 "delta_readout_resmlp",
                 "delta_readout_resmlp_raw",
+                "cc_anchored_linear",
             ) and is_last_readout:
                 node_out = readout(
                     node_feats_concat[feat_idx],

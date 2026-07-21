@@ -202,6 +202,7 @@ def configure_model(
             interaction_method=getattr(args, "interaction_method", "none"),
             method_pca_init=None,
             readout_method=getattr(args, "readout_method", "none"),
+            cc_method_index=getattr(args, "cc_method_index", -1),
             num_readout_basis_heads=getattr(args, "num_readout_basis_heads", 4),
             readout_mixer_hidden_dim=getattr(args, "readout_mixer_hidden_dim", 0),
         )
@@ -216,6 +217,24 @@ def configure_model(
             if args.method_emb_dim is not None and args.method_emb_dim > 0 and pca.shape[1] != args.method_emb_dim:
                 raise ValueError(f"method_pca_file dim {pca.shape[1]} != method_emb_dim {args.method_emb_dim}")
             model_config["method_pca_init"] = pca #torch.tensor(pca, dtype=torch.get_default_dtype())
+        
+        if args.readout_method == "cc_anchored_linear":
+            if args.method_model != "m_pcafix":
+                raise ValueError(
+                    "cc_anchored_linear should initially be used with "
+                    "method_model='m_pcafix'."
+                )
+
+            if args.cc_method_index < 0:
+                raise ValueError(
+                    "cc_anchored_linear requires cc_method_index >= 0."
+                )
+
+            if args.cc_method_index >= args.num_methods:
+                raise ValueError(
+                    f"cc_method_index={args.cc_method_index} is outside "
+                    f"num_methods={args.num_methods}."
+                )
 
     # internal and output conditioning arguments
     model_config["interaction_method"] = getattr(

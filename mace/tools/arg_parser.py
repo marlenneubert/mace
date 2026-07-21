@@ -377,6 +377,17 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--cc_method_index",
+        type=int,
+        default=-1,
+        help=(
+            "Row index of the CC reference in the method descriptor table. "
+            "When non-negative, all method descriptors are centered as "
+            "z_m - z_CC. Required for readout_method='cc_anchored_linear'."
+        ),
+    )
+
+    parser.add_argument(
         "--method_descriptor_adapter",
         type=str,
         default="none",
@@ -440,6 +451,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "readout_resmlp_raw",
             "delta_readout_resmlp",
             "delta_readout_resmlp_raw",
+            "cc_anchored_linear",
         ],
         help=(
             "Optional method conditioning in the final scalar readout. "
