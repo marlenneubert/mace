@@ -1341,6 +1341,7 @@ class ScaleShiftMACE(MACE):
                 "readout_resmlp_raw",
                 "delta_readout_resmlp",
                 "delta_readout_resmlp_raw",
+                "cc_anchored_linear",
             ) and is_last_readout:
                 node_out = readout(
                     node_feats_list[feat_idx],
