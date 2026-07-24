@@ -632,7 +632,7 @@ def get_avg_num_neighbors(head_configs, args, train_loader, device):
 def wrap_same_geometry_pair_loss(
     args: argparse.Namespace,
     loss_fn: torch.nn.Module,
-    pair_weight: float | None = None,
+    pair_weight: Optional[float] = None,
 ) -> torch.nn.Module:
     if pair_weight is None:
         pair_weight = args.pair_loss_weight
@@ -655,6 +655,7 @@ def wrap_same_geometry_pair_loss(
         max_methods_per_structure=args.methods_per_structure,
         cc_method_index=getattr(args, "cc_method_index", -1),
         include_cc=args.pair_include_cc,
+        use_config_weights=getattr(args, "pair_use_config_weights", False),
     )
 
 def get_loss_fn(

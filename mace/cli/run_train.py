@@ -938,6 +938,16 @@ def run(args) -> None:
             "not guaranteed to occur in the same batch."
         )
 
+    method_model = getattr(args, "method_model", "none")
+
+    if pair_loss_weight > 0.0 and method_model in (None, "none"):
+        raise ValueError(
+            "Same-geometry pair loss requires a method-conditioned model. "
+            "With method_model='none', identical geometries produce "
+            "identical predictions for all methods, so the pair-loss "
+            "gradient cannot teach method dependence."
+        )
+
     # The first implementation should operate on one model head.
     # Otherwise, equal structure_index values from different heads could
     # accidentally be grouped together.
@@ -986,6 +996,16 @@ def run(args) -> None:
             num_replicas=world_size if args.distributed else 1,
             rank=rank if args.distributed else 0,
         )
+
+        if (
+            pair_loss_weight > 0.0
+            and same_geometry_batch_sampler.num_pairable == 0
+        ):
+            raise ValueError(
+                "Pair loss was enabled, but the training dataset contains "
+                "no geometries with at least two distinct method labels. "
+                "Check structure_index and method_index in the training data."
+            )  
 
         # tools.train() receives train_sampler and calls set_epoch() on it.
         # Therefore, expose the custom batch sampler through this variable.

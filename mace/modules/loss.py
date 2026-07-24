@@ -655,6 +655,7 @@ class SameGeometryPairLoss(torch.nn.Module):
         max_methods_per_structure: int = 4,
         cc_method_index: int = -1,
         include_cc: bool = False,
+        use_config_weights: bool = False,
     ):
         super().__init__()
 
@@ -692,7 +693,7 @@ class SameGeometryPairLoss(torch.nn.Module):
         )
         self.cc_method_index = int(cc_method_index)
         self.include_cc = bool(include_cc)
-
+        self.use_config_weights = bool(use_config_weights)
         # Useful for optional logging.
         self.last_base_loss = None
         self.last_pair_loss = None
@@ -714,21 +715,25 @@ class SameGeometryPairLoss(torch.nn.Module):
     def _reduce_geometry_losses(
         self,
         geometry_losses,
+        geometry_weights,
         predicted_energy: torch.Tensor,
-        ddp: bool | None,
+        ddp: Optional[bool],
     ) -> torch.Tensor:
         if geometry_losses:
             local_losses = torch.stack(geometry_losses)
-            local_sum = local_losses.sum()
-            local_count = torch.tensor(
-                float(local_losses.numel()),
-                dtype=local_sum.dtype,
-                device=local_sum.device,
-            )
+            local_weights = torch.stack(geometry_weights)
+
+            local_sum = (
+                local_losses * local_weights
+            ).sum()
+
+            local_weight_sum = local_weights.sum()
+
         else:
-            # Differentiable zero.
+            # Differentiable zero for ranks whose batch has no valid pairs.
             local_sum = predicted_energy.sum() * 0.0
-            local_count = torch.zeros(
+
+            local_weight_sum = torch.zeros(
                 (),
                 dtype=predicted_energy.dtype,
                 device=predicted_energy.device,
@@ -737,28 +742,38 @@ class SameGeometryPairLoss(torch.nn.Module):
         use_ddp = is_ddp_enabled() if ddp is None else ddp
 
         if use_ddp and dist.is_initialized():
-            global_count = local_count.clone()
+            global_weight_sum = local_weight_sum.clone()
+
             dist.all_reduce(
-                global_count,
+                global_weight_sum,
                 op=dist.ReduceOp.SUM,
             )
 
-            # DDP averages gradients across ranks, hence world_size.
-            denominator = torch.clamp(global_count, min=1.0)
+            denominator = torch.clamp(
+                global_weight_sum,
+                min=1.0,
+            )
 
+            # DDP averages gradients across ranks. Multiplying by world_size
+            # makes the resulting averaged gradient equal to the gradient of
+            # the globally weighted pair-loss mean.
             return (
                 local_sum
                 * dist.get_world_size()
                 / denominator
             )
 
-        return local_sum / torch.clamp(local_count, min=1.0)
+        # Single-GPU / non-distributed case
+        return local_sum / torch.clamp(
+            local_weight_sum,
+            min=1.0,
+        )
 
     def _pair_loss(
         self,
         ref: Batch,
         pred: TensorDict,
-        ddp: bool | None,
+        ddp: Optional[bool] = None,
     ) -> torch.Tensor:
         if not hasattr(ref, "structure_index"):
             raise ValueError(
@@ -781,6 +796,13 @@ class SameGeometryPairLoss(torch.nn.Module):
         )
         energy_weight = ref["energy_weight"].reshape(-1)
 
+        config_weight = ref["weight"].reshape(-1)
+
+        frame_weight = torch.clamp(
+            config_weight * energy_weight,
+            min=0.0,
+        )
+
         num_atoms = (
             ref.ptr[1:] - ref.ptr[:-1]
         ).to(
@@ -789,7 +811,8 @@ class SameGeometryPairLoss(torch.nn.Module):
         )
 
         geometry_losses = []
-
+        geometry_weights = []
+        
         for structure_id in torch.unique(structure_index):
             indices = torch.nonzero(
                 structure_index == structure_id,
@@ -802,11 +825,28 @@ class SameGeometryPairLoss(torch.nn.Module):
             if indices.numel() < 2:
                 continue
 
-            # Protect against two chunks of a heavily labelled geometry
-            # being packed into the same batch.
-            indices = indices[
-                : self.max_methods_per_structure
-            ]
+            # all entries identified as the same geometry must have exactly the same atom count.
+            group_num_atoms = num_atoms[indices]
+
+            if not torch.all(
+                group_num_atoms == group_num_atoms[0]
+            ).item():
+                raise ValueError(
+                    "Frames with the same structure_index have different atom "
+                    "counts. The pair loss requires identical geometries. "
+                    f"structure_index={int(structure_id.item())}, "
+                    f"atom_counts={group_num_atoms.tolist()}."
+                )
+
+            if indices.numel() > self.max_methods_per_structure:
+                raise RuntimeError(
+                    "A batch contains more method-labelled copies of one geometry "
+                    "than max_methods_per_structure. This probably means multiple "
+                    "chunks from one geometry entered the same batch. "
+                    f"structure_index={int(structure_id.item())}, "
+                    f"entries={indices.numel()}, "
+                    f"maximum={self.max_methods_per_structure}."
+                )
 
             if self.pair_mode == "anchor":
                 left = indices[0].repeat(indices.numel() - 1)
@@ -857,10 +897,41 @@ class SameGeometryPairLoss(torch.nn.Module):
             )
 
             # One contribution per geometry, regardless of pair count.
-            geometry_losses.append(elementwise_loss.mean())
+            if self.use_config_weights:
+                # Symmetric pair weight. A pair is important only when both
+                # constituent frames have nonzero weight.
+                pair_weights = torch.sqrt(
+                    frame_weight[left] * frame_weight[right]
+                )
+
+                pair_weight_sum = pair_weights.sum()
+
+                if pair_weight_sum <= 0.0:
+                    continue
+
+                geometry_loss = (
+                    pair_weights * elementwise_loss
+                ).sum() / pair_weight_sum
+
+                # Preserve geometry balancing: the number of available pairs does
+                # not itself increase the geometry's contribution.
+                geometry_weight = pair_weights.mean()
+
+            else:
+                geometry_loss = elementwise_loss.mean()
+
+                geometry_weight = torch.ones(
+                    (),
+                    dtype=geometry_loss.dtype,
+                    device=geometry_loss.device,
+                )
+
+            geometry_losses.append(geometry_loss)
+            geometry_weights.append(geometry_weight)
 
         return self._reduce_geometry_losses(
             geometry_losses=geometry_losses,
+            geometry_weights=geometry_weights,
             predicted_energy=predicted_energy,
             ddp=ddp,
         )
@@ -869,7 +940,7 @@ class SameGeometryPairLoss(torch.nn.Module):
         self,
         ref: Batch,
         pred: TensorDict,
-        ddp: bool | None = None,
+        ddp: Optional[bool] = None,
     ) -> torch.Tensor:
         base = self.base_loss(
             ref=ref,

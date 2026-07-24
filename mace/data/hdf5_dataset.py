@@ -68,6 +68,15 @@ class HDF5Dataset(Dataset):
             config_type=unpack_value(subgrp["config_type"][()]),
             pbc=unpack_value(subgrp["pbc"][()]),
             cell=unpack_value(subgrp["cell"][()]),
+            # Method-conditioning and pair-loss metadata
+            method_index=unpack_optional_int(
+                subgrp,
+                "method_index",
+            ),
+            structure_index=unpack_optional_int(
+                subgrp,
+                "structure_index",
+            ),
         )
         if config.head is None:
             config.head = self.kwargs.get("head")
@@ -95,3 +104,15 @@ def dataset_from_sharded_hdf5(
 def unpack_value(value):
     value = value.decode("utf-8") if isinstance(value, bytes) else value
     return None if str(value) == "None" else value
+
+def unpack_optional_int(group, key):
+    """Read an optional integer from an HDF5 configuration group."""
+    if key not in group:
+        return None
+
+    value = unpack_value(group[key][()])
+
+    if value is None:
+        return None
+
+    return int(value)

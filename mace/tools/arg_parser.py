@@ -1017,6 +1017,17 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--pair_use_config_weights",
+        action="store_true",
+        default=False,
+        help=(
+            "Weight each same-geometry pair using the ordinary graph "
+            "and energy weights. When disabled, every pairable geometry "
+            "receives equal pair-loss weight."
+        ),
+    )
+
+    parser.add_argument(
         "--optimizer",
         help="Optimizer for parameter optimization",
         type=str,

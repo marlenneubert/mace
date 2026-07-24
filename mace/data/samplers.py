@@ -6,7 +6,7 @@ from typing import Iterator, List, Sequence
 
 import torch
 from torch.utils.data import Sampler
-
+from typing import Iterator, List, Sequence, Set, Tuple
 
 def _scalar_int(value, name: str) -> int:
     if value is None:
@@ -72,6 +72,7 @@ class SameGeometryBatchSampler(Sampler[List[int]]):
         self.epoch = 0
 
         groups = defaultdict(list)
+        methods_by_structure = defaultdict(set)
 
         for dataset_index in range(len(dataset)):
             item = dataset[dataset_index]
@@ -81,16 +82,35 @@ class SameGeometryBatchSampler(Sampler[List[int]]):
                 "structure_index",
             )
 
+            method_index = _scalar_int(
+                getattr(item, "method_index", None),
+                "method_index",
+            )
+
             groups[structure_index].append(dataset_index)
+            methods_by_structure[structure_index].add(method_index)
 
         self.groups = dict(groups)
+        self.methods_by_structure = {
+            structure_index: set(method_indices)
+            for structure_index, method_indices
+            in methods_by_structure.items()
+        }
 
         self.num_structures = len(self.groups)
+
+        # A singleton has only one distinct method, even if that frame was
+        # accidentally duplicated in the input dataset.
         self.num_singletons = sum(
-            len(indices) == 1 for indices in self.groups.values()
+            len(method_indices) == 1
+            for method_indices in self.methods_by_structure.values()
         )
+
+        # A geometry is genuinely pairable only if at least two distinct
+        # methods are available.
         self.num_pairable = sum(
-            len(indices) >= 2 for indices in self.groups.values()
+            len(method_indices) >= 2
+            for method_indices in self.methods_by_structure.values()
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -99,9 +119,9 @@ class SameGeometryBatchSampler(Sampler[List[int]]):
     def _build_global_batches(self) -> List[List[int]]:
         rng = random.Random(self.seed + self.epoch)
 
-        chunks: List[List[int]] = []
+        chunks: List[Tuple[int, List[int]]] = []
 
-        for indices in self.groups.values():
+        for structure_index, indices in self.groups.items():
             local_indices = list(indices)
 
             if self.shuffle:
@@ -113,9 +133,12 @@ class SameGeometryBatchSampler(Sampler[List[int]]):
                 self.methods_per_structure,
             ):
                 chunks.append(
-                    local_indices[
-                        start : start + self.methods_per_structure
-                    ]
+                    (
+                        structure_index,
+                        local_indices[
+                            start : start + self.methods_per_structure
+                        ],
+                    )
                 )
 
         if self.shuffle:
@@ -123,16 +146,26 @@ class SameGeometryBatchSampler(Sampler[List[int]]):
 
         batches: List[List[int]] = []
         current_batch: List[int] = []
+        current_structure_indices: Set[int] = set()
 
-        for chunk in chunks:
-            if (
-                current_batch
-                and len(current_batch) + len(chunk) > self.batch_size
+        for structure_index, chunk in chunks:
+            would_overflow = (
+                len(current_batch) + len(chunk) > self.batch_size
+            )
+
+            duplicate_structure = (
+                structure_index in current_structure_indices
+            )
+
+            if current_batch and (
+                would_overflow or duplicate_structure
             ):
                 batches.append(current_batch)
                 current_batch = []
+                current_structure_indices = set()
 
             current_batch.extend(chunk)
+            current_structure_indices.add(structure_index)
 
         if current_batch:
             batches.append(current_batch)
