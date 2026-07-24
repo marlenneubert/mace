@@ -145,14 +145,14 @@ class AtomicData(torch_geometric.data.Data):
     ## add method_index support for batching
     def __inc__(self, key, value):
         # Do NOT cumulatively increment graph-level method labels across the batch
-        if key == "method_index":
+        if key in ("method_index", "structure_index"):
             return 0
         # Fallback to the default behaviour for everything else
         return super().__inc__(key, value)
     
     def __cat_dim__(self, key, value):
         # For graph-level scalars like method_index, we concatenate along a new batch dim
-        if key == "method_index":
+        if key in ("method_index", "structure_index"):
             # This will be overwritten to None for 0-dim tensors in Batch.from_data_list,
             # which then unsqueezes to shape [n_graphs].
             return 0
@@ -367,6 +367,14 @@ class AtomicData(torch_geometric.data.Data):
             )
         else:
             method_index = None
+        # add structure index
+        if getattr(config, "structure_index", None) is not None:
+            structure_index = torch.tensor(
+                config.structure_index,
+                dtype=torch.long,
+            )
+        else:
+            structure_index = None
 
         cls_kwargs = dict(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
@@ -399,6 +407,10 @@ class AtomicData(torch_geometric.data.Data):
         # method index
         if method_index is not None:
             cls_kwargs["method_index"] = method_index
+
+        # structure index
+        if structure_index is not None:
+            cls_kwargs["structure_index"] = structure_index
 
         # Add other properties that aren't checked. WARNING: shape dependence
         # and unsqueeze(-1) call may implicitly be assuming that these are all

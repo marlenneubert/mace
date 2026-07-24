@@ -417,8 +417,9 @@ def train(
             _apply_method_pca_freeze(model_to_freeze, freeze=freeze_now)
 
         # Train
-        if distributed:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
+
         if "ScheduleFree" in type(optimizer).__name__:
             optimizer.train()
         train_one_epoch(
@@ -725,6 +726,16 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+    
+    if hasattr(loss_fn, "last_base_loss"):
+        loss_dict["base_loss"] = to_numpy(
+            loss_fn.last_base_loss
+        )
+
+    if hasattr(loss_fn, "last_pair_loss"):
+        loss_dict["pair_loss"] = to_numpy(
+            loss_fn.last_pair_loss
+        )
 
     return loss, loss_dict
 
@@ -867,7 +878,9 @@ def evaluate(
         for parameter in parameters:
             parameter.requires_grad_(False)
 
-        metrics = MACELoss(loss_fn=loss_fn).to(device)
+        eval_loss_fn = getattr(loss_fn, "base_loss", loss_fn)
+        metrics = MACELoss(loss_fn=eval_loss_fn).to(device)
+
         start_time = time.time()
 
         for batch in data_loader:

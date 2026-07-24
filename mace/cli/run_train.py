@@ -72,6 +72,7 @@ from mace.tools.scripts_utils import (
 )
 from mace.tools.tables_utils import create_error_table
 from mace.tools.utils import AtomicNumberTable
+from mace.data.samplers import SameGeometryBatchSampler
 
 # fine tuning helpers for CC fine tuning
 def _torch_load_compat(path, map_location="cpu"):
@@ -908,40 +909,135 @@ def run(args) -> None:
         )
         head_config.train_loader = train_loader_head
 
-    # concatenate all the trainsets
+    # Concatenate all training datasets.
     train_set = ConcatDataset([train_sets[head] for head in heads])
-    train_sampler, valid_sampler = None, None
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_set,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=(not args.lbfgs),
-            seed=args.seed,
-        )
-        valid_samplers = {}
-        for head, valid_set in valid_sets.items():
-            valid_sampler = torch.utils.data.distributed.DistributedSampler(
-                valid_set,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                drop_last=True,
-                seed=args.seed,
-            )
-            valid_samplers[head] = valid_sampler
 
-    train_loader = torch_geometric.dataloader.DataLoader(
-        dataset=train_set,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        drop_last=(train_sampler is None and not args.lbfgs),
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
-        generator=torch.Generator().manual_seed(args.seed),
+    train_sampler = None
+    valid_samplers = {}
+
+    use_same_geometry_batches = bool(
+        getattr(args, "same_geometry_batches", False)
     )
+    pair_loss_weight = float(
+        getattr(args, "pair_loss_weight", 0.0)
+    )
+
+    # -------------------------------------------------------------------------
+    # Validate the pair-loss / batching configuration.
+    # -------------------------------------------------------------------------
+
+    if pair_loss_weight < 0.0:
+        raise ValueError(
+            f"pair_loss_weight must be non-negative, got {pair_loss_weight}."
+        )
+
+    if pair_loss_weight > 0.0 and not use_same_geometry_batches:
+        raise ValueError(
+            "pair_loss_weight > 0 requires same_geometry_batches=True. "
+            "Otherwise, method-labelled copies of the same geometry are "
+            "not guaranteed to occur in the same batch."
+        )
+
+    # The first implementation should operate on one model head.
+    # Otherwise, equal structure_index values from different heads could
+    # accidentally be grouped together.
+    if use_same_geometry_batches and len(heads) != 1:
+        raise ValueError(
+            "same_geometry_batches currently requires exactly one training "
+            f"head, but the configured heads are {heads}."
+        )
+
+    # -------------------------------------------------------------------------
+    # Validation samplers:
+    #
+    # Validation does not need geometry grouping. Continue using the ordinary
+    # DistributedSampler exactly as before.
+    # -------------------------------------------------------------------------
+
+    if args.distributed:
+        for head, valid_set in valid_sets.items():
+            valid_samplers[head] = (
+                torch.utils.data.distributed.DistributedSampler(
+                    valid_set,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=True,
+                    seed=args.seed,
+                )
+            )
+
+    # -------------------------------------------------------------------------
+    # Training sampler and loader.
+    # -------------------------------------------------------------------------
+
+    if use_same_geometry_batches:
+        # The custom sampler performs two jobs:
+        #
+        # 1. It keeps multiple method labels of one exact geometry together.
+        # 2. Under DDP, it assigns complete batches to ranks, so a geometry
+        #    group is never split between GPUs.
+        same_geometry_batch_sampler = SameGeometryBatchSampler(
+            dataset=train_set,
+            batch_size=args.batch_size,
+            methods_per_structure=args.methods_per_structure,
+            shuffle=True,
+            seed=args.seed,
+            num_replicas=world_size if args.distributed else 1,
+            rank=rank if args.distributed else 0,
+        )
+
+        # tools.train() receives train_sampler and calls set_epoch() on it.
+        # Therefore, expose the custom batch sampler through this variable.
+        train_sampler = same_geometry_batch_sampler
+
+        train_loader = torch_geometric.dataloader.DataLoader(
+            dataset=train_set,
+
+            # Important: when batch_sampler is provided, do not also provide
+            # batch_size, sampler, shuffle, or drop_last.
+            batch_sampler=same_geometry_batch_sampler,
+
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+        )
+
+        if rank == 0:
+            logging.info(
+                "Same-geometry batching enabled: "
+                "structures=%d, pairable=%d, singletons=%d, "
+                "methods_per_structure=%d, world_size=%d",
+                same_geometry_batch_sampler.num_structures,
+                same_geometry_batch_sampler.num_pairable,
+                same_geometry_batch_sampler.num_singletons,
+                args.methods_per_structure,
+                world_size,
+            )
+
+    else:
+        # Existing training behaviour remains unchanged.
+        if args.distributed:
+            train_sampler = (
+                torch.utils.data.distributed.DistributedSampler(
+                    train_set,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=(not args.lbfgs),
+                    seed=args.seed,
+                )
+            )
+
+        train_loader = torch_geometric.dataloader.DataLoader(
+            dataset=train_set,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            drop_last=(train_sampler is None and not args.lbfgs),
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
 
     valid_loaders = {heads[i]: None for i in range(len(heads))}
     if not isinstance(valid_sets, dict):

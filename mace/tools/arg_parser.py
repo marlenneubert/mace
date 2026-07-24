@@ -931,6 +931,91 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.01,
     )
+    ## pair loss arguments
+    parser.add_argument(
+        "--same_geometry_batches",
+        action="store_true",
+        default=False,
+        help=(
+            "Group method-labelled copies of the same exact geometry "
+            "inside training batches."
+        ),
+    )
+
+    parser.add_argument(
+        "--methods_per_structure",
+        type=int,
+        default=4,
+        help=(
+            "Maximum number of method labels from one geometry used "
+            "inside one pair group."
+        ),
+    )
+
+    parser.add_argument(
+        "--pair_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight of the same-geometry pair loss.",
+    )
+
+    parser.add_argument(
+        "--swa_pair_loss_weight",
+        "--stage_two_pair_loss_weight",
+        dest="swa_pair_loss_weight",
+        type=float,
+        default=-1.0,
+        help=(
+            "Pair-loss weight during Stage Two. A negative value reuses "
+            "pair_loss_weight."
+        ),
+    )
+
+    parser.add_argument(
+        "--pair_mode",
+        type=str,
+        choices=["anchor", "all"],
+        default="anchor",
+        help=(
+            "'anchor' compares one randomly positioned method with the "
+            "remaining methods; 'all' uses all unique pairs."
+        ),
+    )
+
+    parser.add_argument(
+        "--pair_normalization",
+        type=str,
+        choices=["per_atom", "total"],
+        default="per_atom",
+        help=(
+            "Apply pair loss to per-atom or total molecular energy "
+            "differences."
+        ),
+    )
+
+    parser.add_argument(
+        "--pair_loss_type",
+        type=str,
+        choices=["mse", "huber"],
+        default="mse",
+    )
+
+    parser.add_argument(
+        "--pair_huber_delta",
+        type=float,
+        default=0.01,
+    )
+
+    parser.add_argument(
+        "--pair_include_cc",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow CC calibration frames to participate in CC-DFT "
+            "pair terms."
+        ),
+    )
+
     parser.add_argument(
         "--optimizer",
         help="Optimizer for parameter optimization",

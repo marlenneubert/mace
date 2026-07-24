@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from mace.tools import TensorDict
 from mace.tools.torch_geometric import Batch
@@ -636,3 +637,258 @@ class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"
         )
+
+#
+# Same geomtry pair loss
+#
+class SameGeometryPairLoss(torch.nn.Module):
+    """Augment an existing MACE loss with same-geometry energy contrasts."""
+
+    def __init__(
+        self,
+        base_loss: torch.nn.Module,
+        pair_weight: float,
+        pair_mode: str = "anchor",
+        normalization: str = "per_atom",
+        loss_type: str = "mse",
+        huber_delta: float = 0.01,
+        max_methods_per_structure: int = 4,
+        cc_method_index: int = -1,
+        include_cc: bool = False,
+    ):
+        super().__init__()
+
+        if pair_weight < 0.0:
+            raise ValueError("pair_weight must be non-negative.")
+
+        if pair_mode not in ("anchor", "all"):
+            raise ValueError(
+                "pair_mode must be 'anchor' or 'all'."
+            )
+
+        if normalization not in ("per_atom", "total"):
+            raise ValueError(
+                "normalization must be 'per_atom' or 'total'."
+            )
+
+        if loss_type not in ("mse", "huber"):
+            raise ValueError(
+                "loss_type must be 'mse' or 'huber'."
+            )
+
+        if max_methods_per_structure < 2:
+            raise ValueError(
+                "max_methods_per_structure must be at least 2."
+            )
+
+        self.base_loss = base_loss
+        self.pair_weight = float(pair_weight)
+        self.pair_mode = pair_mode
+        self.normalization = normalization
+        self.loss_type = loss_type
+        self.huber_delta = float(huber_delta)
+        self.max_methods_per_structure = int(
+            max_methods_per_structure
+        )
+        self.cc_method_index = int(cc_method_index)
+        self.include_cc = bool(include_cc)
+
+        # Useful for optional logging.
+        self.last_base_loss = None
+        self.last_pair_loss = None
+
+    def _elementwise_pair_loss(
+        self,
+        pair_error: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.loss_type == "mse":
+            return torch.square(pair_error)
+
+        return F.huber_loss(
+            pair_error,
+            torch.zeros_like(pair_error),
+            reduction="none",
+            delta=self.huber_delta,
+        )
+
+    def _reduce_geometry_losses(
+        self,
+        geometry_losses,
+        predicted_energy: torch.Tensor,
+        ddp: bool | None,
+    ) -> torch.Tensor:
+        if geometry_losses:
+            local_losses = torch.stack(geometry_losses)
+            local_sum = local_losses.sum()
+            local_count = torch.tensor(
+                float(local_losses.numel()),
+                dtype=local_sum.dtype,
+                device=local_sum.device,
+            )
+        else:
+            # Differentiable zero.
+            local_sum = predicted_energy.sum() * 0.0
+            local_count = torch.zeros(
+                (),
+                dtype=predicted_energy.dtype,
+                device=predicted_energy.device,
+            )
+
+        use_ddp = is_ddp_enabled() if ddp is None else ddp
+
+        if use_ddp and dist.is_initialized():
+            global_count = local_count.clone()
+            dist.all_reduce(
+                global_count,
+                op=dist.ReduceOp.SUM,
+            )
+
+            # DDP averages gradients across ranks, hence world_size.
+            denominator = torch.clamp(global_count, min=1.0)
+
+            return (
+                local_sum
+                * dist.get_world_size()
+                / denominator
+            )
+
+        return local_sum / torch.clamp(local_count, min=1.0)
+
+    def _pair_loss(
+        self,
+        ref: Batch,
+        pred: TensorDict,
+        ddp: bool | None,
+    ) -> torch.Tensor:
+        if not hasattr(ref, "structure_index"):
+            raise ValueError(
+                "Pair loss requires structure_index on every frame."
+            )
+
+        if not hasattr(ref, "method_index"):
+            raise ValueError(
+                "Pair loss requires method_index on every frame."
+            )
+
+        predicted_energy = pred["energy"].reshape(-1)
+        reference_energy = ref["energy"].reshape(-1)
+
+        structure_index = (
+            ref["structure_index"].reshape(-1).to(torch.long)
+        )
+        method_index = (
+            ref["method_index"].reshape(-1).to(torch.long)
+        )
+        energy_weight = ref["energy_weight"].reshape(-1)
+
+        num_atoms = (
+            ref.ptr[1:] - ref.ptr[:-1]
+        ).to(
+            dtype=predicted_energy.dtype,
+            device=predicted_energy.device,
+        )
+
+        geometry_losses = []
+
+        for structure_id in torch.unique(structure_index):
+            indices = torch.nonzero(
+                structure_index == structure_id,
+                as_tuple=False,
+            ).reshape(-1)
+
+            # Ignore frames without an energy target.
+            indices = indices[energy_weight[indices] > 0.0]
+
+            if indices.numel() < 2:
+                continue
+
+            # Protect against two chunks of a heavily labelled geometry
+            # being packed into the same batch.
+            indices = indices[
+                : self.max_methods_per_structure
+            ]
+
+            if self.pair_mode == "anchor":
+                left = indices[0].repeat(indices.numel() - 1)
+                right = indices[1:]
+            else:
+                combinations = torch.combinations(indices, r=2)
+                left = combinations[:, 0]
+                right = combinations[:, 1]
+
+            # Do not compare duplicate entries of the same method.
+            keep = method_index[left] != method_index[right]
+
+            if not self.include_cc and self.cc_method_index >= 0:
+                keep = keep & (
+                    method_index[left] != self.cc_method_index
+                )
+                keep = keep & (
+                    method_index[right] != self.cc_method_index
+                )
+
+            left = left[keep]
+            right = right[keep]
+
+            if left.numel() == 0:
+                continue
+
+            predicted_difference = (
+                predicted_energy[left]
+                - predicted_energy[right]
+            )
+
+            reference_difference = (
+                reference_energy[left]
+                - reference_energy[right]
+            )
+
+            pair_error = (
+                predicted_difference
+                - reference_difference
+            )
+
+            if self.normalization == "per_atom":
+                # Same exact geometry implies equal atom count.
+                pair_error = pair_error / num_atoms[left]
+
+            elementwise_loss = self._elementwise_pair_loss(
+                pair_error
+            )
+
+            # One contribution per geometry, regardless of pair count.
+            geometry_losses.append(elementwise_loss.mean())
+
+        return self._reduce_geometry_losses(
+            geometry_losses=geometry_losses,
+            predicted_energy=predicted_energy,
+            ddp=ddp,
+        )
+
+    def forward(
+        self,
+        ref: Batch,
+        pred: TensorDict,
+        ddp: bool | None = None,
+    ) -> torch.Tensor:
+        base = self.base_loss(
+            ref=ref,
+            pred=pred,
+            ddp=ddp,
+        )
+
+        if self.pair_weight == 0.0:
+            self.last_base_loss = base.detach()
+            self.last_pair_loss = base.detach() * 0.0
+            return base
+
+        pair = self._pair_loss(
+            ref=ref,
+            pred=pred,
+            ddp=ddp,
+        )
+
+        self.last_base_loss = base.detach()
+        self.last_pair_loss = pair.detach()
+
+        return base + self.pair_weight * pair

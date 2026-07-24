@@ -102,6 +102,7 @@ class Configuration:
     head: str = "Default"  # head used to compute the config
 
     method_index: Optional[int] = None  # ADDED integer ID of the method
+    structure_index: Optional[int] = None # added for pair loss, integer ID of the structure
 
 
 Configurations = List[Configuration]
@@ -200,6 +201,18 @@ def config_from_atoms(
             raise ValueError(
                 f"Invalid method_index {method_index!r} in atoms.info; expected an int."
             ) from exc
+        
+    # Exact-geometry identifier for same-geometry pair loss
+    structure_index = atoms.info.get("structure_index", None)
+
+    if structure_index is not None:
+        try:
+            structure_index = int(structure_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid structure_index {structure_index!r} in atoms.info; "
+                "expected an integer."
+            ) from exc
 
     properties = {}
     property_weights = {}
@@ -227,6 +240,7 @@ def config_from_atoms(
         pbc=pbc,
         cell=cell,
         method_index=method_index,
+        structure_index=structure_index,
     )
 
 
@@ -450,6 +464,7 @@ def save_configurations_as_HDF5(configurations: Configurations, _, h5_file) -> N
         subgroup["config_type"] = write_value(config.config_type)
         # store method_index if available
         subgroup["method_index"] = write_value(config.method_index)
+        subgroup["structure_index"] = write_value(config.structure_index)
 
 
 def write_value(value):

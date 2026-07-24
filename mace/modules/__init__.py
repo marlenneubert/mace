@@ -34,6 +34,7 @@ from .loss import (
     WeightedEnergyForcesVirialsLoss,
     WeightedForcesLoss,
     WeightedHuberEnergyForcesStressLoss,
+    SameGeometryPairLoss,
 )
 from .models import (
     MACE,
@@ -124,4 +125,5 @@ __all__ = [
     "compute_fixed_charge_dipole",
     "compute_fixed_charge_dipole_polar",
     "compute_dielectric_gradients",
+    "SameGeometryPairLoss",
 ]

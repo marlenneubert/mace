@@ -629,6 +629,33 @@ def get_avg_num_neighbors(head_configs, args, train_loader, device):
         logging.info(f"Average number of neighbors: {avg_num_neighbors_out}")
     return avg_num_neighbors_out
 
+def wrap_same_geometry_pair_loss(
+    args: argparse.Namespace,
+    loss_fn: torch.nn.Module,
+    pair_weight: float | None = None,
+) -> torch.nn.Module:
+    if pair_weight is None:
+        pair_weight = args.pair_loss_weight
+
+    if pair_weight <= 0.0:
+        return loss_fn
+
+    if not args.same_geometry_batches:
+        raise ValueError(
+            "Pair loss requires same_geometry_batches=True."
+        )
+
+    return modules.SameGeometryPairLoss(
+        base_loss=loss_fn,
+        pair_weight=pair_weight,
+        pair_mode=args.pair_mode,
+        normalization=args.pair_normalization,
+        loss_type=args.pair_loss_type,
+        huber_delta=args.pair_huber_delta,
+        max_methods_per_structure=args.methods_per_structure,
+        cc_method_index=getattr(args, "cc_method_index", -1),
+        include_cc=args.pair_include_cc,
+    )
 
 def get_loss_fn(
     args: argparse.Namespace,
@@ -693,6 +720,12 @@ def get_loss_fn(
         )
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
+
+    loss_fn = wrap_same_geometry_pair_loss(
+        args=args,
+        loss_fn=loss_fn,
+    )
+
     return loss_fn
 
 
@@ -768,6 +801,18 @@ def get_swa(
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
         )
+
+    stage_two_pair_weight = args.swa_pair_loss_weight
+
+    if stage_two_pair_weight < 0.0:
+        stage_two_pair_weight = args.pair_loss_weight
+
+    loss_fn_energy = wrap_same_geometry_pair_loss(
+        args=args,
+        loss_fn=loss_fn_energy,
+        pair_weight=stage_two_pair_weight,
+    )
+
     swa = SWAContainer(
         model=AveragedModel(model),
         scheduler=SWALR(
@@ -779,6 +824,7 @@ def get_swa(
         start=args.start_swa,
         loss_fn=loss_fn_energy,
     )
+
     return swa, swas
 
 
