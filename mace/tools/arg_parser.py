@@ -1162,6 +1162,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--resume_checkpoint_interval",
+        help=(
+            "Save a rolling restart checkpoint every N epochs. "
+            "This checkpoint is independent of best-model selection. "
+            "Set to 0 to disable."
+        ),
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
         "--save_cpu",
         help="Save a model to be loaded on cpu",
         action="store_true",

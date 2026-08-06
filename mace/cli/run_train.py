@@ -1175,27 +1175,122 @@ def run(args) -> None:
         swa_start=args.start_swa,
     )
 
+    # Separate rolling checkpoint used only for interrupted-job restarts.
+    resume_checkpoint_path = (
+        Path(args.checkpoints_dir) / f"{tag}_resume.pt"
+    )
+
     start_epoch = 0
     restart_lbfgs = False
     opt_start_epoch = None
-    if args.restart_latest:
+    loaded_resume_checkpoint = False
+
+    # For a genuinely new run, retain the original behavior:
+    # the first evaluated epoch should become the first best checkpoint.
+    initial_lowest_loss = float("inf")
+    initial_patience_counter = 0
+
+    if args.restart_latest and resume_checkpoint_path.is_file():
+        logging.info(
+            "Loading rolling resume checkpoint: "
+            f"{resume_checkpoint_path}"
+        )
+
+        resume_state = _torch_load_compat(
+            resume_checkpoint_path,
+            map_location=device,
+        )
+
+        required_keys = {
+            "model",
+            "optimizer",
+            "lr_scheduler",
+            "epoch",
+        }
+        missing_keys = required_keys.difference(resume_state)
+
+        if missing_keys:
+            raise RuntimeError(
+                "Rolling resume checkpoint is missing required keys: "
+                f"{sorted(missing_keys)}"
+            )
+
+        model.load_state_dict(
+            resume_state["model"],
+            strict=True,
+        )
+        optimizer.load_state_dict(
+            resume_state["optimizer"]
+        )
+        lr_scheduler.load_state_dict(
+            resume_state["lr_scheduler"]
+        )
+
+        saved_epoch = int(resume_state["epoch"])
+
+        # The saved epoch was already completed.
+        start_epoch = saved_epoch + 1
+
+        initial_lowest_loss = float(
+            resume_state.get("lowest_loss", float("inf"))
+        )
+        initial_patience_counter = int(
+            resume_state.get("patience_counter", 0)
+        )
+
+        loaded_resume_checkpoint = True
+
+        logging.info(
+            "Rolling checkpoint loaded successfully: "
+            f"last completed epoch={saved_epoch}, "
+            f"next epoch={start_epoch}, "
+            f"lowest_loss={initial_lowest_loss:.8f}, "
+            f"patience_counter={initial_patience_counter}"
+        )
+
+    elif args.restart_latest:
+        # No rolling checkpoint exists yet. Fall back to MACE's original
+        # best-checkpoint loading for runs created before this feature.
         try:
             opt_start_epoch = checkpoint_handler.load_latest(
-                state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                state=tools.CheckpointState(
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                ),
                 swa=True,
                 device=device,
             )
         except Exception:  # pylint: disable=W0703
             try:
                 opt_start_epoch = checkpoint_handler.load_latest(
-                    state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                    state=tools.CheckpointState(
+                        model,
+                        optimizer,
+                        lr_scheduler,
+                    ),
                     swa=False,
                     device=device,
                 )
-            except Exception: # pylint: disable=W0703
+            except Exception:  # pylint: disable=W0703
                 restart_lbfgs = True
+
         if opt_start_epoch is not None:
-            start_epoch = opt_start_epoch
+            # The ordinary checkpoint was saved after completing this epoch.
+            start_epoch = opt_start_epoch + 1
+
+            # Old checkpoints do not contain historical lowest_loss.
+            # train() will evaluate the loaded model and use that value as
+            # the baseline. This is appropriate because the ordinary
+            # checkpoint is a best-validation checkpoint.
+            initial_lowest_loss = None
+            initial_patience_counter = 0
+
+            logging.info(
+                "Loaded ordinary best checkpoint: "
+                f"last completed epoch={opt_start_epoch}, "
+                f"next epoch={start_epoch}"
+            )
 
     ema: Optional[ExponentialMovingAverage] = None
     if args.ema:
@@ -1282,6 +1377,10 @@ def run(args) -> None:
         logger=logger,
         patience=args.patience,
         save_all_checkpoints=args.save_all_checkpoints,
+        resume_checkpoint_path=str(resume_checkpoint_path),
+        resume_checkpoint_interval=args.resume_checkpoint_interval,
+        initial_lowest_loss=initial_lowest_loss,
+        initial_patience_counter=initial_patience_counter,
         output_args=output_args,
         device=device,
         swa=swa,

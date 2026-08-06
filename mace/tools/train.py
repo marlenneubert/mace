@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import os
 from numbers import Number
 
 import numpy as np
@@ -345,6 +345,10 @@ def train(
     log_wandb: bool = False,
     distributed: bool = False,
     save_all_checkpoints: bool = False,
+    resume_checkpoint_path: Optional[str] = None,
+    resume_checkpoint_interval: int = 0,
+    initial_lowest_loss: Optional[float] = None,
+    initial_patience_counter: int = 0,
     plotter: TrainingPlotter = None,
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
@@ -353,9 +357,15 @@ def train(
     method_pca_freeze_epochs: int = 0,
     method_descriptor_adapter_reg_weight: float = 0.0,
 ):
-    lowest_loss = np.inf
+    lowest_loss = (
+        float(initial_lowest_loss)
+        if initial_lowest_loss is not None
+        else np.inf
+    )
     valid_loss = np.inf
-    patience_counter = 0
+    patience_counter = int(initial_patience_counter)
+
+
     swa_start = True
     keep_last = False
     if log_wandb:
@@ -385,6 +395,10 @@ def train(
             valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
         )
     valid_loss = valid_loss_head  # consider only the last head for the checkpoint
+    # For an existing checkpoint without stored best-loss metadata,
+    # use its current validation loss as the initial baseline.
+    if initial_lowest_loss is None:
+        lowest_loss = float(valid_loss)
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
@@ -596,6 +610,33 @@ def train(
                             keep_last=keep_last,
                         )
                         keep_last = False or save_all_checkpoints
+            if (
+                rank == 0
+                and resume_checkpoint_path is not None
+                and resume_checkpoint_interval > 0
+                and epoch % resume_checkpoint_interval == 0
+            ):
+                resume_state = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "epoch": int(epoch),
+                    "lowest_loss": float(lowest_loss),
+                    "patience_counter": int(patience_counter),
+                }
+
+                resume_path = os.fspath(resume_checkpoint_path)
+                temporary_path = f"{resume_path}.tmp"
+
+                torch.save(resume_state, temporary_path)
+                os.replace(temporary_path, resume_path)
+
+                logging.info(
+                    "Saved rolling resume checkpoint: "
+                    f"{resume_path} at epoch {epoch}"
+                )
+
+        
         if distributed:
             torch.distributed.barrier()
             torch.distributed.broadcast(exit_now, src=0)
