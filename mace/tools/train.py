@@ -481,7 +481,7 @@ def train(
                             wandb_log_flat["lr_max"] = float(max(lrs))
                 
                 # add: wandb log train metrics, every train_metrics_interval epochs
-                if (epoch % train_metrics_interval) == 0:
+                if log_wandb and (epoch % train_metrics_interval) == 0:
                     train_loss_head, train_metrics = evaluate(
                         model=model_to_evaluate,
                         loss_fn=loss_fn,
@@ -489,7 +489,7 @@ def train(
                         output_args=output_args,
                         device=device,
                     )
-                    if log_wandb and rank == 0:
+                    if rank == 0:
                         wandb_log_flat["train/train_loss"] = float(train_loss_head)
 
                         train_mae_e = _wandb_scalar(train_metrics.get("mae_e"))
