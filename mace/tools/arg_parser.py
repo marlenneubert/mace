@@ -722,6 +722,8 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "'readout_only' trains all model.readouts. "
             "'adapter' trains readouts plus method-conditioning modules. "
             "'adapter_scale_shift' additionally trains model.scale_shift."
+            "'cc_residual_only' freezes the complete pretrained model and "
+            "trains only the newly added CC-specific residual head."
         ),
         type=str,
         default="none",
@@ -731,9 +733,28 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "readout_only",
             "adapter",
             "adapter_scale_shift",
+            "cc_residual_only",
         ],
     )
+    parser.add_argument(
+        "--cc_residual_hidden_dim",
+        type=int,
+        default=0,
+        help=(
+            "Hidden dimension of the CC-specific residual head. "
+            "0 disables the head."
+        ),
+    )
 
+    parser.add_argument(
+        "--cc_residual_method_index",
+        type=int,
+        default=-1,
+        help=(
+            "Method index for which the CC residual head is active. "
+            "For every other method the residual is exactly zero."
+        ),
+    )
     # Keys
     parser.add_argument(
         "--energy_key",

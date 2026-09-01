@@ -32,6 +32,7 @@ from .blocks import (
     ContinuousBasisReadoutBlock,
     ReadoutFiLMBlock,
     DeltaReadoutFiLMBlock,
+    CCResidualReadoutBlock,
     ReadoutResMLPBlock,
     DeltaReadoutResMLPBlock,
     CCAnchoredLinearReadoutBlock,
@@ -133,7 +134,9 @@ class MACE(torch.nn.Module):
         readout_method: str = "none",
         cc_method_index: int = -1,
         num_readout_basis_heads: int = 4,
-        readout_mixer_hidden_dim: int = 0,        
+        readout_mixer_hidden_dim: int = 0,
+        cc_residual_hidden_dim: int = 0,
+        cc_residual_method_index: int = -1,       
     ):
         super().__init__()
         self.register_buffer(
@@ -176,6 +179,9 @@ class MACE(torch.nn.Module):
         self.readout_method = readout_method
         self.num_readout_basis_heads = num_readout_basis_heads
         self.readout_mixer_hidden_dim = readout_mixer_hidden_dim
+        # cc head
+        self.cc_residual_hidden_dim = int(cc_residual_hidden_dim)
+        self.cc_residual_method_index = int(cc_residual_method_index)
 
         # check
         if self.interaction_method not in ("none", "radial_concat", "radial_film"):
@@ -272,6 +278,26 @@ class MACE(torch.nn.Module):
                     "The initial cc_anchored_linear implementation requires "
                     "method_model='m_pcafix'."
                 )
+
+        if self.cc_residual_hidden_dim < 0:
+            raise ValueError(
+                "cc_residual_hidden_dim must be >= 0."
+            )
+
+        if self.cc_residual_hidden_dim > 0:
+            if self.cc_residual_method_index < 0:
+                raise ValueError(
+                    "cc_residual_hidden_dim > 0 requires "
+                    "cc_residual_method_index >= 0."
+                )
+
+            if self.cc_residual_method_index >= self.num_methods:
+                raise ValueError(
+                    f"cc_residual_method_index="
+                    f"{self.cc_residual_method_index} must be smaller than "
+                    f"num_methods={self.num_methods}."
+                )
+
 
         # Embedding
         # Keep the original chemical node attrs irreps for interaction/product blocks
@@ -749,6 +775,25 @@ class MACE(torch.nn.Module):
                         oeq_config,
                     )
                 )
+        # ------------------------------------------------------------------
+        # Optional CC-specific residual adaptation head
+        # ------------------------------------------------------------------
+        #
+        # At this point hidden_irreps_out corresponds to the output of the
+        # final interaction/product block. In the standard MACE energy model,
+        # the final interaction is deliberately scalar-only.
+        #
+        # The residual head therefore receives the final invariant per-atom
+        # representation directly.
+        if self.cc_residual_hidden_dim > 0:
+            self.cc_residual_head = CCResidualReadoutBlock(
+                irreps_in=o3.Irreps(hidden_irreps_out),
+                hidden_dim=self.cc_residual_hidden_dim,
+            )
+        else:
+            # Parameter-free placeholder. This adds no state_dict entries.
+            self.cc_residual_head = torch.nn.Identity()
+
     # helpers for radial MLP conditioning
     def _get_method_idx_graph(
         self,
@@ -760,6 +805,57 @@ class MACE(torch.nn.Module):
         if method_idx_graph.dim() > 1:
             method_idx_graph = method_idx_graph.squeeze(-1)
         return method_idx_graph
+
+    def _get_cc_residual_node_energy(
+        self,
+        final_node_feats: torch.Tensor,
+        method_idx_graph: Optional[torch.Tensor],
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+
+        # Backward compatibility:
+        # old serialized MACE models do not contain these attributes.
+        if (
+            not hasattr(self, "cc_residual_hidden_dim")
+            or self.cc_residual_hidden_dim <= 0
+        ):
+            return torch.zeros(
+                final_node_feats.shape[0],
+                dtype=final_node_feats.dtype,
+                device=final_node_feats.device,
+            )
+
+        if method_idx_graph is None:
+            raise ValueError(
+                "CC residual adaptation requires method_index in the batch."
+            )
+
+        if not hasattr(self, "cc_residual_head"):
+            raise RuntimeError(
+                "CC residual adaptation is enabled but cc_residual_head "
+                "was not constructed."
+            )
+
+        # Per-atom residual:
+        #
+        # [n_nodes, hidden] -> [n_nodes, 1] -> [n_nodes]
+        residual_node_e = self.cc_residual_head(
+            final_node_feats
+        ).squeeze(-1)
+
+        # One Boolean value per molecular graph.
+        cc_graph_mask = (
+            method_idx_graph == self.cc_residual_method_index
+        ).to(
+            dtype=residual_node_e.dtype,
+            device=residual_node_e.device,
+        )
+
+        # Expand graph-level CC mask to all atoms in each graph.
+        cc_node_mask = cc_graph_mask[batch]
+
+        # Exactly zero for every non-CC graph.
+        return residual_node_e * cc_node_mask
 
     def _get_method_z_graph(
         self,
@@ -1083,9 +1179,35 @@ class MACE(torch.nn.Module):
             energies.append(energy)
             node_energies_list.append(node_es)
 
+        # --------------------------------------------------------------
+        # CC-specific residual from the final frozen node representation
+        # --------------------------------------------------------------
+        cc_residual_node_e = self._get_cc_residual_node_energy(
+            final_node_feats=node_feats_concat[-1],
+            method_idx_graph=method_idx_graph,
+            batch=batch,
+        )
+
+        cc_residual_e = scatter_sum(
+            src=cc_residual_node_e,
+            index=batch,
+            dim=0,
+            dim_size=num_graphs,
+        )
+
         contributions = torch.stack(energies, dim=-1)
-        total_energy = torch.sum(contributions, dim=-1)
-        node_energy = torch.sum(torch.stack(node_energies_list, dim=-1), dim=-1)
+        total_energy = (
+            torch.sum(contributions, dim=-1)
+            + cc_residual_e
+        )
+
+        node_energy = (
+            torch.sum(
+                torch.stack(node_energies_list, dim=-1),
+                dim=-1,
+            )
+            + cc_residual_node_e
+        )
         node_feats_out = torch.cat(node_feats_concat, dim=-1)
 
         forces, virials, stress, hessian, edge_forces = get_outputs(
@@ -1361,16 +1483,37 @@ class ScaleShiftMACE(MACE):
 
             node_es_list.append(node_es)
 
+        # --------------------------------------------------------------
+        # CC-specific residual
+        #
+        # Importantly, this is computed from the final MACE representation
+        # but added AFTER the parent's scale/shift transformation.
+        # The residual therefore has the direct interpretation of an
+        # energy correction in eV.
+        # --------------------------------------------------------------
+        cc_residual_node_e = self._get_cc_residual_node_energy(
+            final_node_feats=node_feats_list[-1],
+            method_idx_graph=method_idx_graph,
+            batch=batch,
+        )
+
+        cc_residual_e = scatter_sum(
+            src=cc_residual_node_e,
+            index=batch,
+            dim=0,
+            dim_size=num_graphs,
+        )
+
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
         node_inter_es = self.scale_shift(node_inter_es, node_heads)
         inter_e = scatter_sum(node_inter_es, data["batch"], dim=-1, dim_size=num_graphs)
 
-        total_energy = e0 + inter_e
-        node_energy = node_e0.clone().double() + node_inter_es.clone().double()
+        total_energy = e0 + inter_e + cc_residual_e
+        node_energy = node_e0.clone().double() + node_inter_es.clone().double() + cc_residual_node_e.clone().double()
 
         forces, virials, stress, hessian, edge_forces = get_outputs(
-            energy=inter_e,
+            energy=inter_e + cc_residual_e,
             positions=positions,
             displacement=displacement,
             vectors=vectors,
@@ -1397,7 +1540,7 @@ class ScaleShiftMACE(MACE):
         return {
             "energy": total_energy,
             "node_energy": node_energy,
-            "interaction_energy": inter_e,
+            "interaction_energy": inter_e + cc_residual_e,
             "forces": forces,
             "edge_forces": edge_forces,
             "virials": virials,

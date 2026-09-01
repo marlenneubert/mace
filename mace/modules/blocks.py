@@ -431,6 +431,80 @@ class DeltaReadoutFiLMBlock(torch.nn.Module):
         return eps_base + delta_eps
 
 @compile_mode("script")
+class CCResidualReadoutBlock(torch.nn.Module):
+    """
+    Small CC-specific residual readout.
+
+    Maps final scalar MACE node features to an atomic CC correction:
+
+        delta_e_i = W2 * SiLU(W1 * h_i + b1)
+
+    The final layer:
+      - has no bias;
+      - is initialized to zero.
+
+    Therefore the residual is exactly zero at initialization.
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        hidden_dim: int = 4,
+    ):
+        super().__init__()
+
+        irreps_in = o3.Irreps(irreps_in)
+
+        if irreps_in.lmax > 0:
+            raise ValueError(
+                "CCResidualReadoutBlock expects scalar-only input irreps. "
+                f"Got irreps_in={irreps_in}."
+            )
+
+        if hidden_dim <= 0:
+            raise ValueError(
+                "CCResidualReadoutBlock requires hidden_dim > 0."
+            )
+
+        in_dim = irreps_in.count(o3.Irrep(0, 1))
+
+        if in_dim <= 0:
+            raise ValueError(
+                f"Could not infer scalar input dimension from {irreps_in}."
+            )
+
+        self.linear_1 = torch.nn.Linear(
+            in_dim,
+            hidden_dim,
+            bias=True,
+        )
+
+        self.activation = torch.nn.SiLU()
+
+        # Deliberately no final bias.
+        # Otherwise the molecular residual contains an automatic
+        # N_atoms * bias contribution.
+        self.linear_2 = torch.nn.Linear(
+            hidden_dim,
+            1,
+            bias=False,
+        )
+
+        # Exact zero-residual initialization:
+        #
+        #   delta_e_i = 0
+        #
+        # for every atom before adaptation starts.
+        torch.nn.init.zeros_(self.linear_2.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        h = self.activation(self.linear_1(x))
+        return self.linear_2(h)
+
+@compile_mode("script")
 class CCAnchoredLinearReadoutBlock(torch.nn.Module):
     """Final scalar readout anchored at the CC method coordinate.
 

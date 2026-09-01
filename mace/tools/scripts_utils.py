@@ -325,6 +325,12 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         "interaction_method": (
             model.interaction_method if hasattr(model, "interaction_method") else "none"
         ),
+        "cc_residual_hidden_dim": int(
+            getattr(model, "cc_residual_hidden_dim", 0)
+        ),
+        "cc_residual_method_index": int(
+            getattr(model, "cc_residual_method_index", -1)
+        ),
     }
     if model.__class__.__name__ == "AtomicDielectricMACE":
         config["use_polarizability"] = model.use_polarizability
@@ -976,6 +982,18 @@ def get_params_options(
     if len(method_param_groups) > 0:
         param_options["params"].extend(method_param_groups)    
 
+    # CC-specific residual adaptation head
+    if (
+        hasattr(model, "cc_residual_head")
+        and getattr(model, "cc_residual_hidden_dim", 0) > 0
+    ):
+        param_options["params"].append(
+            {
+                "name": "cc_residual_head",
+                "params": model.cc_residual_head.parameters(),
+                "weight_decay": 0.0,
+            }
+        )
 
     return param_options
 

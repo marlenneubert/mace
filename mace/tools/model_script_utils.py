@@ -260,6 +260,19 @@ def configure_model(
         model_config.get("readout_mixer_hidden_dim", 0),
     )
 
+    model_config["cc_residual_hidden_dim"] = getattr(
+        args,
+        "cc_residual_hidden_dim",
+        model_config.get("cc_residual_hidden_dim", 0),
+    )
+
+    model_config["cc_residual_method_index"] = getattr(
+        args,
+        "cc_residual_method_index",
+        model_config.get("cc_residual_method_index", -1),
+    )
+
+
     model = _build_model(args, model_config, model_config_foundation, heads)
 
     if model_foundation is not None:

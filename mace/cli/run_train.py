@@ -82,8 +82,58 @@ def _torch_load_compat(path, map_location="cpu"):
     except TypeError:
         return torch.load(path, map_location=map_location)
 
+def get_finetune_parent_avg_num_neighbors(path: str) -> float:
+    """
+    Read avg_num_neighbors from the complete pretrained model.
 
-def load_exact_finetune_weights(model, path, device):
+    This value affects the forward function but is not restored by
+    load_state_dict(), so exact fine-tuning must preserve it explicitly.
+    """
+    obj = _torch_load_compat(path, map_location="cpu")
+
+    if isinstance(obj, torch.nn.Module):
+        parent = obj
+    elif (
+        isinstance(obj, dict)
+        and "model" in obj
+        and isinstance(obj["model"], torch.nn.Module)
+    ):
+        parent = obj["model"]
+    else:
+        raise ValueError(
+            "Cannot recover avg_num_neighbors from finetune_model. "
+            "For exact fine-tuning, finetune_model should point to a complete "
+            "serialized .model file."
+        )
+
+    interactions = getattr(parent, "interactions", None)
+    if interactions is None or len(interactions) == 0:
+        raise ValueError(
+            "Fine-tune parent has no interaction blocks from which "
+            "avg_num_neighbors can be recovered."
+        )
+
+    values = [
+        float(block.avg_num_neighbors)
+        for block in interactions
+    ]
+
+    if max(values) - min(values) > 1.0e-12:
+        raise ValueError(
+            "Fine-tune parent has inconsistent avg_num_neighbors "
+            f"across interaction blocks: {values}"
+        )
+
+    value = values[0]
+
+    logging.info(
+        "Preserving avg_num_neighbors from fine-tune parent: %.15g",
+        value,
+    )
+
+    return value
+
+def load_exact_finetune_weights(model, path, device, allow_new_cc_residual=False):
     """Load weights from a trained .model or checkpoint into an already-built model."""
     logging.info(f"Loading exact fine-tuning weights from: {path}")
 
@@ -149,15 +199,54 @@ def load_exact_finetune_weights(model, path, device):
                 f"checkpoint={tuple(source_tensor.shape)}, "
                 f"current_model={tuple(target_tensor.shape)}"
             )
+    ##
+    if not allow_new_cc_residual:
+        model.load_state_dict(
+            state_dict,
+            strict=True,
+        )
 
-    model.load_state_dict(
-        state_dict,
-        strict=True,
-    )
+        logging.info(
+            "Fine-tune model weights loaded successfully with strict=True."
+        )
 
-    logging.info(
-        "Fine-tune model weights loaded successfully with strict=True."
-    )
+    else:
+        incompatible = model.load_state_dict(
+            state_dict,
+            strict=False,
+        )
+
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+
+        allowed_missing = {
+            key
+            for key in model.state_dict().keys()
+            if key.startswith("cc_residual_head.")
+        }
+
+        # For a fresh residual-adaptation experiment, the parent should
+        # contain NONE of the new residual-head parameters.
+        if missing != allowed_missing:
+            raise RuntimeError(
+                "Unexpected missing keys while loading parent model for "
+                "CC residual adaptation. "
+                f"missing={sorted(missing)}, "
+                f"expected={sorted(allowed_missing)}"
+            )
+
+        if unexpected:
+            raise RuntimeError(
+                "Unexpected checkpoint keys while loading parent model for "
+                "CC residual adaptation: "
+                f"{sorted(unexpected)}"
+            )
+
+        logging.info(
+            "Fine-tune parent loaded exactly; only the new CC residual "
+            "parameters were absent from the parent checkpoint: %s",
+            sorted(missing),
+        )
 
     return model
 
@@ -248,6 +337,27 @@ def set_finetune_freeze(model, mode):
         # Only the method-conditioned delta correction is trainable.
         # The shared geometry-only readout remains frozen.
         _unfreeze_delta_readout_only(model)
+
+    elif mode == "cc_residual_only":
+        if getattr(model, "cc_residual_hidden_dim", 0) <= 0:
+            raise ValueError(
+                "finetune_freeze='cc_residual_only' requires "
+                "cc_residual_hidden_dim > 0."
+            )
+
+        residual_head = getattr(
+            model,
+            "cc_residual_head",
+            None,
+        )
+
+        if residual_head is None:
+            raise ValueError(
+                "finetune_freeze='cc_residual_only' requested but "
+                "the model has no cc_residual_head."
+            )
+
+        _unfreeze_module(residual_head)
 
     elif mode == "readout_only":
         # All readouts become trainable, including:
@@ -1075,16 +1185,61 @@ def run(args) -> None:
         )
 
     loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole)
-    args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
+    if getattr(args, "finetune_model", None) is not None:
+        parent_avg_num_neighbors = get_finetune_parent_avg_num_neighbors(
+            args.finetune_model
+        )
+
+        # Keep the global args consistent.
+        args.compute_avg_num_neighbors = False
+        args.avg_num_neighbors = parent_avg_num_neighbors
+
+        # HeadConfig objects were already created earlier, so update them too.
+        for head_config in head_configs:
+            head_config.compute_avg_num_neighbors = False
+            head_config.avg_num_neighbors = parent_avg_num_neighbors
+
+        logging.info(
+            "Fine-tuning: using parent avg_num_neighbors = %.15g",
+            args.avg_num_neighbors,
+        )
+    else:
+        args.avg_num_neighbors = get_avg_num_neighbors(
+            head_configs,
+            args,
+            train_loader,
+            device,
+        )
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+
+    # sanity check avg neighbors
+    if getattr(args, "finetune_model", None) is not None:
+        interaction_avgs = [
+            float(block.avg_num_neighbors)
+            for block in model.interactions
+        ]
+
+        if any(
+            abs(value - args.avg_num_neighbors) > 1.0e-12
+            for value in interaction_avgs
+        ):
+            raise RuntimeError(
+                "Constructed fine-tune model does not preserve parent "
+                f"avg_num_neighbors: expected={args.avg_num_neighbors}, "
+                f"got={interaction_avgs}"
+            )
 
     if getattr(args, "finetune_model", None) is not None:
         model = load_exact_finetune_weights(
             model=model,
             path=args.finetune_model,
             device=device,
+            allow_new_cc_residual=(
+            getattr(args, "finetune_freeze", "none")
+            == "cc_residual_only"
+        ),
         )
 
     if not args.compute_forces:
